@@ -16,9 +16,25 @@ SUPPORTED_EXTENSIONS = {
 # Directories that never contain useful project code
 # Indexing node_modules or .git would be both slow and useless
 IGNORED_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv",
-    "env", ".env", "dist", "build", ".next", ".nuxt",
-    "coverage", ".pytest_cache", ".mypy_cache", "target",
+    # Universal
+    ".git",
+    # Python
+    "node_modules", "__pycache__", ".venv", "venv", "env", ".env",
+    ".pytest_cache", ".mypy_cache",
+    # JS/TS
+    "dist", "build", ".next", ".nuxt", "coverage", ".turbo",
+    # Java / Kotlin / Gradle
+    "target", ".gradle", "out", "classes",
+    # .NET / C#
+    "bin", "obj", ".vs", "packages",
+    # Rust
+    # "target" already covered above
+    # Go
+    "vendor",
+    # Ruby
+    ".bundle",
+    # General
+    "tmp", "temp", "logs", ".cache",
 }
 
 
