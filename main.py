@@ -1,5 +1,5 @@
 import os
-from agentfield import Agent, AIConfig
+from agentfield import Agent, AIConfig, MemoryConfig
 
 # We import both routers we'll build — indexing logic and Q&A logic
 # kept in separate files so each has one clear responsibility
@@ -12,13 +12,15 @@ app = Agent(
     version="1.0.0",
     dev_mode=True,
 
-    # Ollama runs locally — no API key needed, no cost
-    # LiteLLM (used under the hood by Agentfield) understands "ollama/model-name"
-    # api_base tells it where Ollama is running on your machine
+    # Groq — free tier, extremely fast inference (~1-3s responses)
+    # Get your free API key at: https://console.groq.com
+    # Set it with: export GROQ_API_KEY=your_key_here
     ai_config=AIConfig(
-        model="ollama/llama3.2",
-        api_base="http://localhost:11434",
+        model="groq/llama-3.3-70b-versatile",
     ),
+    # Persistent memory so the index survives across executions
+    # Default is "session" which clears data when each request finishes
+    memory_config=MemoryConfig(auto_inject=[], memory_retention="persistent", cache_results=False),
 )
 
 # Register both routers with the agent
