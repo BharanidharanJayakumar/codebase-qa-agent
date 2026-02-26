@@ -1,3 +1,4 @@
+import math
 from pydantic import BaseModel, Field
 from agentfield import AgentRouter
 
@@ -5,6 +6,8 @@ from skills.extractor import extract_keywords
 from skills.storage import load_index
 
 qa_router = AgentRouter(prefix="qa", tags=["question-answering"])
+
+MIN_SCORE = 0.5  # Minimum BM25 score to consider a file relevant
 
 
 class Answer(BaseModel):
@@ -14,65 +17,78 @@ class Answer(BaseModel):
     follow_up: list[str] = Field(description="1-2 follow-up questions the user might want to ask")
 
 
-class FileMatch(BaseModel):
-    files: list[str] = Field(description="File paths ranked by relevance, most relevant first")
-    reasoning: str = Field(description="Brief explanation of why these files are relevant")
-
-
 def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_map: dict) -> dict:
     """
-    Pure Python retrieval — find the most relevant files for a query.
-    No LLM needed here. Returns actual file content for the top matches.
+    Retrieve relevant chunks using BM25 IDF scoring + symbol boosting.
+    Returns formatted context with actual source code for the LLM.
     """
     query_keywords = extract_keywords(query, top_n=10)
     query_words = query.lower().split()
+    total_files = len(file_index)
 
     # Direct symbol name matches (strongest signal)
-    symbol_hits = {
-        word: symbol_map[word]
-        for word in query_words
-        if word in symbol_map
-    }
+    # symbol_map is now one-to-many: each name → list of locations
+    symbol_hits = {}
+    for word in query_words:
+        if word in symbol_map:
+            symbol_hits[word] = symbol_map[word]  # list of {file, line, type}
 
-    # Score files by keyword frequency
-    file_scores: dict[str, int] = {}
+    # BM25 IDF scoring: rare keywords score higher than common ones
+    file_scores: dict[str, float] = {}
     for kw in query_keywords:
-        for file_path in keyword_map.get(kw, []):
-            file_scores[file_path] = file_scores.get(file_path, 0) + 1
+        files_with_kw = keyword_map.get(kw, [])
+        if not files_with_kw:
+            continue
+        df = len(files_with_kw)
+        idf = math.log((total_files - df + 0.5) / (df + 0.5) + 1)
+        for file_path in files_with_kw:
+            file_scores[file_path] = file_scores.get(file_path, 0) + idf
 
-    # Boost files with direct symbol hits
-    for sym_info in symbol_hits.values():
-        file_path = sym_info["file"]
-        file_scores[file_path] = file_scores.get(file_path, 0) + 5
+    # Boost all files with direct symbol hits (one-to-many)
+    for sym_name, locations in symbol_hits.items():
+        for loc in locations:
+            file_path = loc["file"]
+            file_scores[file_path] = file_scores.get(file_path, 0) + 5
 
-    # Top 5 most relevant files
-    ranked = sorted(file_scores.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_files = [path for path, _ in ranked]
+    # Filter by minimum score, then take top 5
+    ranked = [(p, s) for p, s in file_scores.items() if s >= MIN_SCORE]
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    top_files = [path for path, _ in ranked[:5]]
 
-    # Build context from ACTUAL file content — not pre-baked summaries
-    # This is why indexing is now instant: we stored raw content, not LLM outputs
-    # The LLM sees real code at query time, giving much more accurate answers
+    # Build context from semantic chunks, not the truncated 4000-char blob
     context_parts = []
     for file_path in top_files:
         meta = file_index.get(file_path, {})
-        if meta:
+        chunks = meta.get("chunks", [])
+        if not chunks:
+            continue
+        for chunk in chunks:
+            sym_label = f" ({chunk['symbol']})" if chunk.get("symbol") else ""
             context_parts.append(
-                f"=== File: {file_path} ===\n"
-                f"{meta.get('content_chunk', '')}"
+                f"=== {file_path} [lines {chunk['start_line']}-{chunk['end_line']}]{sym_label} ===\n"
+                f"{chunk['content']}"
             )
 
-    # Add symbol location info if directly matched
-    for sym_name, sym_info in symbol_hits.items():
-        context_parts.append(
-            f"\n[Symbol `{sym_name}` defined in {sym_info['file']} "
-            f"at line {sym_info['line']} ({sym_info['type']})]"
-        )
+    # Add symbol location hints
+    for sym_name, locations in symbol_hits.items():
+        for loc in locations:
+            context_parts.append(
+                f"\n[Symbol `{sym_name}` defined in {loc['file']} "
+                f"at line {loc['line']} ({loc['type']})]"
+            )
+
+    # Meaningful confidence based on score quality, not file count
+    top_score = ranked[0][1] if ranked else 0
+    max_possible = len(query_keywords) * math.log(total_files + 1) + 5 if total_files else 1
+    ratio = top_score / max_possible if max_possible > 0 else 0
+    confidence = "high" if ratio >= 0.3 else "medium" if ratio >= 0.1 else "low"
 
     return {
         "context": "\n\n".join(context_parts),
         "top_files": top_files,
         "symbol_hits": symbol_hits,
-        "confidence": "high" if len(top_files) >= 3 else "medium" if top_files else "low",
+        "confidence": confidence,
+        "top_score": top_score,
     }
 
 
@@ -82,12 +98,10 @@ async def answer_question(question: str) -> dict:
     Answer any question about the indexed codebase.
 
     Flow:
-    1. Load index from memory (instant)
-    2. Keyword retrieval finds top 5 relevant files (instant, no LLM)
-    3. Pass actual file content to Ollama — LLM answers from real code
+    1. Load index from disk (instant)
+    2. BM25 keyword retrieval finds top 5 relevant files (instant, no LLM)
+    3. Pass actual source code chunks to LLM — answers from real code
     4. Return structured answer with source files
-
-    LLM is only called ONCE per question, on real code, not summaries.
 
     curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_answer_question \\
       -H "Content-Type: application/json" \\
@@ -109,7 +123,18 @@ async def answer_question(question: str) -> dict:
 
     retrieved = _retrieve_context(question, file_index, keyword_map, symbol_map)
 
-    # Single LLM call with actual code content — happens only at query time
+    # Guard: if no files matched, don't call the LLM with empty context
+    if not retrieved["top_files"]:
+        return {
+            "answer": (
+                "No relevant files found for this question. "
+                "Try using specific function names, class names, or file names from the codebase."
+            ),
+            "relevant_files": [],
+            "confidence": "low",
+            "follow_up": [],
+        }
+
     result = await qa_router.ai(
         system=(
             "You are an expert software engineer helping a developer understand a codebase. "
@@ -142,7 +167,7 @@ async def answer_question(question: str) -> dict:
 async def find_relevant_files(query: str) -> dict:
     """
     Return the most relevant files for a topic — pure keyword retrieval, no LLM.
-    Fastest endpoint — instant response.
+    Genuinely instant response.
 
     curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_find_relevant_files \\
       -H "Content-Type: application/json" \\
@@ -158,13 +183,11 @@ async def find_relevant_files(query: str) -> dict:
 
     retrieved = _retrieve_context(query, file_index, keyword_map, symbol_map)
 
-    result = await qa_router.ai(
-        system="You are a code navigation assistant. Briefly explain why these files are relevant.",
-        user=f"Query: {query}\n\nTop matching files:\n" + "\n".join(retrieved["top_files"]),
-        schema=FileMatch,
-    )
-
+    # Pure retrieval — no LLM call
+    symbol_names = list(retrieved["symbol_hits"].keys())
     return {
         "files": retrieved["top_files"],
-        "reasoning": result.reasoning,
+        "symbol_hits": symbol_names,
+        "confidence": retrieved["confidence"],
+        "reasoning": f"Matched {len(retrieved['top_files'])} files via BM25 keyword scoring and symbol lookup.",
     }

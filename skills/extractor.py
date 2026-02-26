@@ -1,5 +1,6 @@
 import re
 from collections import Counter
+from pathlib import Path
 
 
 # Regex patterns per language to find function/class definitions
@@ -128,7 +129,7 @@ def extract_symbols(content: str, file_path: str) -> list[dict]:
     Trade-off: regex misses edge cases (multiline signatures, decorators),
     but it's fast, dependency-free, and good enough for our search index.
     """
-    ext = "." + file_path.rsplit(".", 1)[-1] if "." in file_path else ""
+    ext = Path(file_path).suffix
     patterns = SYMBOL_PATTERNS.get(ext, [])
     if not patterns:
         return []
@@ -156,6 +157,63 @@ def extract_symbols(content: str, file_path: str) -> list[dict]:
                 break  # one symbol per line max
 
     return symbols
+
+
+def chunk_file(content: str, symbols: list[dict], max_chunk_lines: int = 60) -> list[dict]:
+    """
+    Split file content into semantic chunks at symbol boundaries.
+
+    Instead of storing the first 4000 chars (losing everything after line ~100),
+    we split at function/class boundaries so every symbol body is preserved.
+
+    Each chunk has: start_line, end_line, content, symbol (if the chunk starts at one).
+    Files with no symbols get a single full-file chunk.
+    """
+    lines = content.splitlines()
+    total_lines = len(lines)
+
+    if not symbols or total_lines == 0:
+        # No symbols detected — store the whole file as one chunk (up to 200 lines)
+        return [{"start_line": 1, "end_line": min(total_lines, 200),
+                 "content": "\n".join(lines[:200]), "symbol": None}]
+
+    # Sort symbols by line number
+    sorted_syms = sorted(symbols, key=lambda s: s["line"])
+
+    chunks = []
+
+    # If the file starts with content before the first symbol (imports, comments),
+    # capture that as a header chunk
+    first_sym_line = sorted_syms[0]["line"]
+    if first_sym_line > 1:
+        header_end = first_sym_line - 1
+        chunks.append({
+            "start_line": 1,
+            "end_line": header_end,
+            "content": "\n".join(lines[:header_end]),
+            "symbol": None,
+        })
+
+    # Create a chunk for each symbol — from its line to the next symbol (or EOF)
+    for i, sym in enumerate(sorted_syms):
+        start = sym["line"]
+        if i + 1 < len(sorted_syms):
+            end = sorted_syms[i + 1]["line"] - 1
+        else:
+            end = total_lines
+
+        # Cap at max_chunk_lines to avoid giant chunks
+        end = min(end, start + max_chunk_lines - 1)
+
+        chunk_lines = lines[start - 1:end]  # lines is 0-indexed, symbols are 1-indexed
+        chunks.append({
+            "start_line": start,
+            "end_line": end,
+            "content": "\n".join(chunk_lines),
+            "symbol": sym["name"],
+        })
+
+    return chunks
 
 
 def extract_keywords(content: str, top_n: int = 20) -> list[str]:
