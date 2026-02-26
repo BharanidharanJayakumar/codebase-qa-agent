@@ -3,7 +3,14 @@ from pydantic import BaseModel, Field
 from agentfield import AgentRouter
 
 from skills.extractor import extract_keywords
-from skills.storage import load_index
+from skills.storage import load_index, load_session, save_session_turn, list_indexed_projects
+
+# Embeddings are optional — degrade gracefully if not installed
+try:
+    from skills.embeddings import build_chunk_embeddings, semantic_search
+    EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
 
 qa_router = AgentRouter(prefix="qa", tags=["question-answering"])
 
@@ -20,7 +27,7 @@ class Answer(BaseModel):
 
 def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_map: dict) -> dict:
     """
-    Retrieve relevant chunks using BM25 IDF scoring + symbol boosting.
+    Hybrid retrieval: BM25 IDF + symbol boosting + optional semantic similarity.
     Returns formatted context with actual source code for the LLM.
     """
     query_keywords = extract_keywords(query, top_n=10)
@@ -28,11 +35,10 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
     total_files = len(file_index)
 
     # Direct symbol name matches (strongest signal)
-    # symbol_map is now one-to-many: each name → list of locations
     symbol_hits = {}
     for word in query_words:
         if word in symbol_map:
-            symbol_hits[word] = symbol_map[word]  # list of {file, line, type}
+            symbol_hits[word] = symbol_map[word]
 
     # BM25 IDF scoring: rare keywords score higher than common ones
     file_scores: dict[str, float] = {}
@@ -50,6 +56,18 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
         for loc in locations:
             file_path = loc["file"]
             file_scores[file_path] = file_scores.get(file_path, 0) + 5
+
+    # Semantic search boost (if embeddings are available)
+    if EMBEDDINGS_AVAILABLE and total_files > 0:
+        try:
+            chunk_keys, chunk_vectors = build_chunk_embeddings(file_index)
+            if len(chunk_vectors) > 0:
+                sem_results = semantic_search(query, chunk_keys, chunk_vectors, top_k=10)
+                for rel_path, chunk_idx, score in sem_results:
+                    if score > 0.3:  # Only boost meaningfully similar chunks
+                        file_scores[rel_path] = file_scores.get(rel_path, 0) + score * 3
+        except Exception:
+            pass  # Graceful degradation — BM25 still works
 
     # Filter by minimum score, then take top 5
     ranked = [(p, s) for p, s in file_scores.items() if s >= MIN_SCORE]
@@ -102,27 +120,24 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
 
 
 @qa_router.reasoner()
-async def answer_question(question: str) -> dict:
+async def answer_question(question: str, session_id: str = "", project_path: str = "") -> dict:
     """
     Answer any question about the indexed codebase.
-
-    Flow:
-    1. Load index from disk (instant)
-    2. BM25 keyword retrieval finds top 5 relevant files (instant, no LLM)
-    3. Pass actual source code chunks to LLM — answers from real code
-    4. Return structured answer with source files
+    Pass a session_id to enable follow-up questions with conversation memory.
+    Pass a project_path to query a specific project (defaults to most recently indexed).
 
     curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_answer_question \\
       -H "Content-Type: application/json" \\
-      -d '{"input": {"question": "How does authentication work?"}}'
+      -d '{"input": {"question": "How does authentication work?", "session_id": "s1"}}'
     """
-    stored = load_index()
+    stored = load_index(project_path)
     if not stored:
         return {
             "answer": "No index found. Please run index_project first.",
             "relevant_files": [],
             "confidence": "low",
             "follow_up": [],
+            "session_id": session_id,
         }
 
     file_index = stored["file_index"]
@@ -130,7 +145,21 @@ async def answer_question(question: str) -> dict:
     symbol_map = stored["symbol_map"]
     project_root = stored["project_root"]
 
-    retrieved = _retrieve_context(question, file_index, keyword_map, symbol_map)
+    # Load conversation history if session_id provided
+    history = load_session(session_id) if session_id else []
+
+    # For follow-up questions, enrich the query with context from previous turns
+    # so BM25 retrieval can find relevant files even for vague follow-ups like "what about its tests?"
+    enriched_query = question
+    if history:
+        prev_files = []
+        prev_keywords = []
+        for turn in history[-2:]:  # last 2 turns for keyword enrichment
+            prev_files.extend(turn.get("relevant_files", []))
+            prev_keywords.extend(extract_keywords(turn["question"], top_n=5))
+        enriched_query = f"{question} {' '.join(prev_keywords)}"
+
+    retrieved = _retrieve_context(enriched_query, file_index, keyword_map, symbol_map)
 
     # Guard: if no files matched, don't call the LLM with empty context
     if not retrieved["top_files"]:
@@ -142,7 +171,20 @@ async def answer_question(question: str) -> dict:
             "relevant_files": [],
             "confidence": "low",
             "follow_up": [],
+            "session_id": session_id,
         }
+
+    # Build conversation history for the LLM prompt
+    history_block = ""
+    if history:
+        parts = []
+        for turn in history[-3:]:  # last 3 turns max
+            parts.append(f"Q: {turn['question']}\nA: {turn['answer']}")
+        history_block = (
+            "Previous conversation:\n"
+            + "\n---\n".join(parts)
+            + "\n\n---\nNow answer the follow-up question below.\n\n"
+        )
 
     result = await qa_router.ai(
         system=(
@@ -153,12 +195,20 @@ async def answer_question(question: str) -> dict:
             "If the context is insufficient, say so clearly."
         ),
         user=(
+            f"{history_block}"
             f"Question: {question}\n\n"
             f"Relevant source code from the codebase:\n\n"
             f"{retrieved['context']}"
         ),
         schema=Answer,
     )
+
+    # Save this turn to the session
+    if session_id:
+        save_session_turn(
+            session_id, question,
+            result.answer, retrieved["top_files"]
+        )
 
     qa_router.app.note(
         f"Q: {question[:80]} | Files: {retrieved['top_files']} | Confidence: {retrieved['confidence']}",
@@ -169,11 +219,12 @@ async def answer_question(question: str) -> dict:
         **result.model_dump(),
         "relevant_files": retrieved["top_files"],
         "confidence": retrieved["confidence"],
+        "session_id": session_id,
     }
 
 
 @qa_router.reasoner()
-async def find_relevant_files(query: str) -> dict:
+async def find_relevant_files(query: str, project_path: str = "") -> dict:
     """
     Return the most relevant files for a topic — pure keyword retrieval, no LLM.
     Genuinely instant response.
@@ -182,7 +233,7 @@ async def find_relevant_files(query: str) -> dict:
       -H "Content-Type: application/json" \\
       -d '{"input": {"query": "authentication jwt token"}}'
     """
-    stored = load_index()
+    stored = load_index(project_path)
     if not stored:
         return {"files": [], "reasoning": "No index found. Run index_project first."}
 
@@ -199,4 +250,20 @@ async def find_relevant_files(query: str) -> dict:
         "symbol_hits": symbol_names,
         "confidence": retrieved["confidence"],
         "reasoning": f"Matched {len(retrieved['top_files'])} files via BM25 keyword scoring and symbol lookup.",
+    }
+
+
+@qa_router.reasoner()
+async def list_projects() -> dict:
+    """
+    List all indexed projects. Pure retrieval, no LLM.
+
+    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_list_projects \\
+      -H "Content-Type: application/json" \\
+      -d '{"input": {}}'
+    """
+    projects = list_indexed_projects()
+    return {
+        "projects": projects,
+        "total": len(projects),
     }

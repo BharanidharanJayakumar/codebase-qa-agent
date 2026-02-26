@@ -121,14 +121,24 @@ STOP_WORDS = {
 def extract_symbols(content: str, file_path: str) -> list[dict]:
     """
     Extract function, class, and type definitions from source code.
-
+    Tries tree-sitter AST parsing first (accurate), falls back to regex (fast, universal).
     Returns a list of {name, type, line} dicts.
-    We use regex rather than AST parsing so this works across all languages
-    without needing separate parsers installed per language.
-
-    Trade-off: regex misses edge cases (multiline signatures, decorators),
-    but it's fast, dependency-free, and good enough for our search index.
     """
+    # Try tree-sitter first for accurate parsing
+    try:
+        from skills.ast_parser import extract_symbols_ast
+        ast_result = extract_symbols_ast(content, file_path)
+        if ast_result is not None:
+            return ast_result
+    except ImportError:
+        pass
+
+    # Fall back to regex
+    return _extract_symbols_regex(content, file_path)
+
+
+def _extract_symbols_regex(content: str, file_path: str) -> list[dict]:
+    """Regex-based symbol extraction. Works across all languages without dependencies."""
     ext = Path(file_path).suffix
     patterns = SYMBOL_PATTERNS.get(ext, [])
     if not patterns:
@@ -142,7 +152,6 @@ def extract_symbols(content: str, file_path: str) -> list[dict]:
             match = re.search(pattern, line)
             if match and "name" in match.groupdict():
                 name = match.group("name")
-                # Determine type from which pattern matched
                 symbol_type = (
                     "class" if "class" in pattern
                     else "interface" if "interface" in pattern
@@ -154,8 +163,7 @@ def extract_symbols(content: str, file_path: str) -> list[dict]:
                     "type": symbol_type,
                     "line": line_num,
                 })
-                break  # one symbol per line max
-
+                break
     return symbols
 
 

@@ -1,8 +1,11 @@
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from agentfield import Agent, AIConfig, MemoryConfig
 
-# We import both routers we'll build — indexing logic and Q&A logic
-# kept in separate files so each has one clear responsibility
+# Always load .env from this file's directory, not the CWD
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from reasoners.indexer import indexer_router
 from reasoners.qa import qa_router
 

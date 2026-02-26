@@ -105,7 +105,7 @@ async def update_index(project_path: str) -> dict:
     """
     Incrementally update the index: re-index changed files, remove deleted ones.
     """
-    stored = load_index()
+    stored = load_index(project_path)
     if not stored:
         return {"error": "No index found. Run index_project first.", "files_updated": 0}
 
@@ -172,6 +172,57 @@ async def update_index(project_path: str) -> dict:
         "updated_files": [f["relative_path"] for f in changed],
         "deleted_files": list(deleted),
         "message": f"Re-indexed {len(changed)} changed, removed {len(deleted)} deleted file(s).",
+    }
+
+
+@indexer_router.reasoner()
+async def watch_project(project_path: str) -> dict:
+    """
+    Start watching a project for file changes. Automatically re-indexes when files change.
+
+    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.indexer_watch_project \\
+      -H "Content-Type: application/json" \\
+      -d '{"input": {"project_path": "/home/you/myproject"}}'
+    """
+    try:
+        from skills.watcher import start_watching, list_watchers
+    except ImportError:
+        return {"error": "watchfiles not installed. Run: pip install watchfiles", "watching": False}
+
+    project = Path(project_path).resolve()
+    if not project.is_dir():
+        return {"error": f"Not a directory: {project_path}", "watching": False}
+
+    async def _on_change(path):
+        await update_index(path)
+        indexer_router.app.note(f"Auto-updated index for {path}", tags=["watcher"])
+
+    watcher_id = await start_watching(str(project), _on_change)
+    return {
+        "watching": bool(watcher_id),
+        "project_path": str(project),
+        "active_watchers": list_watchers(),
+    }
+
+
+@indexer_router.reasoner()
+async def unwatch_project(project_path: str) -> dict:
+    """
+    Stop watching a project directory.
+
+    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.indexer_unwatch_project \\
+      -H "Content-Type: application/json" \\
+      -d '{"input": {"project_path": "/home/you/myproject"}}'
+    """
+    try:
+        from skills.watcher import stop_watching, list_watchers
+    except ImportError:
+        return {"stopped": False}
+
+    stopped = stop_watching(project_path)
+    return {
+        "stopped": stopped,
+        "active_watchers": list_watchers(),
     }
 
 
