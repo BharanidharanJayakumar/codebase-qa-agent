@@ -8,6 +8,7 @@ from skills.storage import load_index
 qa_router = AgentRouter(prefix="qa", tags=["question-answering"])
 
 MIN_SCORE = 0.5  # Minimum BM25 score to consider a file relevant
+MAX_CONTEXT_CHARS = 24_000  # ~6000 tokens — fits comfortably in 8K context window
 
 
 class Answer(BaseModel):
@@ -55,8 +56,10 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
     ranked.sort(key=lambda x: x[1], reverse=True)
     top_files = [path for path, _ in ranked[:5]]
 
-    # Build context from semantic chunks, not the truncated 4000-char blob
+    # Build context from semantic chunks with token budget enforcement.
+    # Pack chunks in order of file relevance until we hit MAX_CONTEXT_CHARS.
     context_parts = []
+    chars_used = 0
     for file_path in top_files:
         meta = file_index.get(file_path, {})
         chunks = meta.get("chunks", [])
@@ -64,12 +67,18 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
             continue
         for chunk in chunks:
             sym_label = f" ({chunk['symbol']})" if chunk.get("symbol") else ""
-            context_parts.append(
+            part = (
                 f"=== {file_path} [lines {chunk['start_line']}-{chunk['end_line']}]{sym_label} ===\n"
                 f"{chunk['content']}"
             )
+            if chars_used + len(part) > MAX_CONTEXT_CHARS:
+                break  # Budget exhausted — stop packing
+            context_parts.append(part)
+            chars_used += len(part)
+        if chars_used >= MAX_CONTEXT_CHARS:
+            break
 
-    # Add symbol location hints
+    # Add symbol location hints (small, always fits)
     for sym_name, locations in symbol_hits.items():
         for loc in locations:
             context_parts.append(

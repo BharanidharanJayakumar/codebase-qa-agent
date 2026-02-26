@@ -29,7 +29,22 @@ async def index_project(project_path: str) -> dict:
       -H "Content-Type: application/json" \\
       -d '{"input": {"project_path": "/home/you/myproject"}}'
     """
+    # Validate input path
+    project = Path(project_path).resolve()
+    if not project.exists():
+        return {"error": f"Path does not exist: {project_path}", "files_indexed": 0}
+    if not project.is_dir():
+        return {"error": f"Path is not a directory: {project_path}", "files_indexed": 0}
+
     files = scan_directory(project_path)
+
+    if not files:
+        return IndexResult(
+            files_indexed=0,
+            project_root=str(project),
+            indexed_at=time.time(),
+            message="No indexable source files found in this directory.",
+        ).model_dump()
 
     file_index = {}    # rel_path → {chunks, keywords, symbols, ...}
     keyword_map = {}   # keyword → [rel_paths]

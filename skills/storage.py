@@ -131,7 +131,8 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
 
 
 def load_index() -> dict | None:
-    """Load the full index from SQLite. Returns None if no index exists."""
+    """Load the full index from SQLite. Returns None if no index exists.
+    If the DB is corrupted, deletes it and returns None (triggers re-index)."""
     # Try legacy JSON migration first
     if not DB_FILE.exists() and LEGACY_JSON.exists():
         return _migrate_from_json()
@@ -139,7 +140,13 @@ def load_index() -> dict | None:
     if not DB_FILE.exists():
         return None
 
-    conn = _get_db()
+    try:
+        conn = _get_db()
+    except Exception:
+        # DB file exists but is corrupted — delete and trigger re-index
+        DB_FILE.unlink(missing_ok=True)
+        return None
+
     try:
         # Check schema version
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
@@ -199,8 +206,16 @@ def load_index() -> dict | None:
             "keyword_map": keyword_map,
             "symbol_map": symbol_map,
         }
-    finally:
+    except (sqlite3.DatabaseError, json.JSONDecodeError, KeyError, ValueError):
+        # DB is corrupted or has invalid data — delete and trigger re-index
         conn.close()
+        DB_FILE.unlink(missing_ok=True)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _migrate_from_json() -> dict | None:
