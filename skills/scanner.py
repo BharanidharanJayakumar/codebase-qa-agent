@@ -165,11 +165,3 @@ def read_file(file_path: str, max_bytes: int = 50_000) -> dict:
         return {"path": str(path), "content": "", "error": "permission_denied"}
     except OSError as e:
         return {"path": str(path), "content": "", "error": str(e)}
-
-
-def get_changed_files(root_path: str, since_timestamp: float) -> list[dict]:
-    """
-    Return only files modified after `since_timestamp` (a Unix timestamp).
-    """
-    all_files = scan_directory(root_path)
-    return [f for f in all_files if f["last_modified"] > since_timestamp]

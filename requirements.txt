@@ -1,7 +1,12 @@
+# Core (required)
 agentfield
 pydantic>=2.0
 python-dotenv
-sentence-transformers>=2.2.0
-numpy>=1.24.0
+
+# Optional — lightweight, recommended
 tree-sitter>=0.21.0
 watchfiles>=0.21.0
+
+# Optional — heavy (~3GB with PyTorch), enables semantic search
+# sentence-transformers>=2.2.0
+# numpy>=1.24.0
