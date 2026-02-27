@@ -5,18 +5,29 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 INDEX_DIR = Path.home() / ".codebase-qa-agent"
 DB_FILE = INDEX_DIR / "index.db"  # legacy single-project path
 # Keep the old JSON path for migration
 LEGACY_JSON = INDEX_DIR / "index.json"
 
 
+def _make_slug(project_root: str) -> str:
+    """Generate a human-readable slug from a project path. e.g. 'codebase-qa-agent'."""
+    return Path(project_root).name.lower().replace(" ", "-")
+
+
+def _make_project_id(project_root: str) -> str:
+    """Generate a unique project ID: slug + short hash. e.g. 'codebase-qa-agent_a1b2c3d4e5f6'."""
+    slug = _make_slug(project_root)
+    short_hash = hashlib.sha256(project_root.encode()).hexdigest()[:12]
+    return f"{slug}_{short_hash}"
+
+
 def _project_db_path(project_root: str) -> Path:
-    """Return a per-project DB path based on a hash of the project root."""
-    slug = hashlib.sha256(project_root.encode()).hexdigest()[:12]
-    name = Path(project_root).name  # human-readable prefix
-    return INDEX_DIR / "projects" / f"{name}_{slug}.db"
+    """Return a per-project DB path based on project ID."""
+    project_id = _make_project_id(project_root)
+    return INDEX_DIR / "projects" / f"{project_id}.db"
 
 
 def _get_db(db_path: Path | None = None) -> sqlite3.Connection:
@@ -72,6 +83,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (keyword, rel_path)
         );
 
+        CREATE TABLE IF NOT EXISTS embeddings (
+            rel_path TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            PRIMARY KEY (rel_path, chunk_index),
+            FOREIGN KEY (rel_path) REFERENCES files(rel_path) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_chunks_rel_path ON chunks(rel_path);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_keyword_files_keyword ON keyword_files(keyword);
@@ -86,16 +105,21 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
     try:
         conn.execute("BEGIN")
         # Clear existing data
+        conn.execute("DELETE FROM embeddings")
         conn.execute("DELETE FROM chunks")
         conn.execute("DELETE FROM symbols")
         conn.execute("DELETE FROM keyword_files")
         conn.execute("DELETE FROM files")
 
         # Metadata
+        slug = _make_slug(project_root)
+        project_id = _make_project_id(project_root)
         conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
         conn.execute("INSERT OR REPLACE INTO meta VALUES ('project_root', ?)", (project_root,))
         conn.execute("INSERT OR REPLACE INTO meta VALUES ('indexed_at', ?)", (str(indexed_at),))
         conn.execute("INSERT OR REPLACE INTO meta VALUES ('total_files', ?)", (str(len(file_index)),))
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('slug', ?)", (slug,))
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('project_id', ?)", (project_id,))
 
         # Files
         for rel_path, meta in file_index.items():
@@ -142,21 +166,19 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
 
 
 def load_index(project_path: str = "") -> dict | None:
-    """Load the index for a specific project. Falls back to legacy DB if no project_path.
+    """Load the index for a specific project. Accepts path, slug, or project_id.
+    Falls back to legacy DB if no project_path.
     If the DB is corrupted, deletes it and returns None (triggers re-index)."""
     # Try legacy JSON migration first
     if not DB_FILE.exists() and LEGACY_JSON.exists():
         return _migrate_from_json()
 
-    # Determine which DB to open
-    if project_path:
-        db_path = _project_db_path(project_path)
-    else:
-        # Check per-project DBs first (return most recently indexed)
+    # Determine which DB to open — supports path, slug, or project_id
+    db_path = resolve_project_db(project_path) if project_path else None
+    if db_path is None:
         db_path = _find_latest_project_db()
-        if db_path is None:
-            # Fall back to legacy single-project DB
-            db_path = DB_FILE
+    if db_path is None:
+        db_path = DB_FILE
 
     if not db_path.exists():
         return None
@@ -218,9 +240,15 @@ def load_index(project_path: str = "") -> dict | None:
                 "type": row["type"],
             })
 
+        slug_row = conn.execute("SELECT value FROM meta WHERE key='slug'").fetchone()
+        pid_row = conn.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+        root_val = project_root["value"]
+
         return {
             "schema_version": SCHEMA_VERSION,
-            "project_root": project_root["value"],
+            "project_root": root_val,
+            "project_id": pid_row["value"] if pid_row else _make_project_id(root_val),
+            "slug": slug_row["value"] if slug_row else _make_slug(root_val),
             "indexed_at": float(indexed_at["value"]),
             "file_index": file_index,
             "keyword_map": keyword_map,
@@ -249,7 +277,7 @@ def _find_latest_project_db() -> Path | None:
 
 
 def list_indexed_projects() -> list[dict]:
-    """List all indexed projects with metadata."""
+    """List all indexed projects with metadata including slug and project_id."""
     projects_dir = INDEX_DIR / "projects"
     if not projects_dir.exists():
         return []
@@ -260,17 +288,124 @@ def list_indexed_projects() -> list[dict]:
             root = conn.execute("SELECT value FROM meta WHERE key='project_root'").fetchone()
             at = conn.execute("SELECT value FROM meta WHERE key='indexed_at'").fetchone()
             total = conn.execute("SELECT value FROM meta WHERE key='total_files'").fetchone()
+            slug_row = conn.execute("SELECT value FROM meta WHERE key='slug'").fetchone()
+            pid_row = conn.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
             conn.close()
             if root:
+                project_root = root["value"]
                 results.append({
-                    "project_root": root["value"],
+                    "project_id": pid_row["value"] if pid_row else _make_project_id(project_root),
+                    "slug": slug_row["value"] if slug_row else _make_slug(project_root),
+                    "project_root": project_root,
                     "indexed_at": float(at["value"]) if at else 0,
                     "total_files": int(total["value"]) if total else 0,
-                    "db_file": str(db_path),
                 })
         except Exception:
             continue
     return results
+
+
+def delete_project(project_identifier: str) -> bool:
+    """Delete an indexed project by path, slug, or project_id. Returns True if deleted."""
+    projects_dir = INDEX_DIR / "projects"
+    if not projects_dir.exists():
+        return False
+
+    for db_path in projects_dir.glob("*.db"):
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            root = conn.execute("SELECT value FROM meta WHERE key='project_root'").fetchone()
+            slug_row = conn.execute("SELECT value FROM meta WHERE key='slug'").fetchone()
+            pid_row = conn.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+            conn.close()
+
+            match = False
+            if root and root["value"] == project_identifier:
+                match = True
+            elif slug_row and slug_row["value"] == project_identifier:
+                match = True
+            elif pid_row and pid_row["value"] == project_identifier:
+                match = True
+
+            if match:
+                db_path.unlink()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def resolve_project_db(identifier: str) -> Path | None:
+    """Resolve a project identifier (path, slug, or project_id) to its DB path."""
+    if not identifier:
+        return _find_latest_project_db()
+
+    # Direct path match first (fastest)
+    direct = _project_db_path(identifier)
+    if direct.exists():
+        return direct
+
+    # Search by slug or project_id
+    projects_dir = INDEX_DIR / "projects"
+    if not projects_dir.exists():
+        return None
+
+    for db_path in projects_dir.glob("*.db"):
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            slug_row = conn.execute("SELECT value FROM meta WHERE key='slug'").fetchone()
+            pid_row = conn.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+            conn.close()
+
+            if slug_row and slug_row["value"] == identifier:
+                return db_path
+            if pid_row and pid_row["value"] == identifier:
+                return db_path
+        except Exception:
+            continue
+    return None
+
+
+def save_embeddings(project_root: str, embeddings_data: list[tuple[str, int, bytes]]) -> None:
+    """Save pre-computed embeddings to the project DB.
+    embeddings_data: list of (rel_path, chunk_index, vector_bytes)"""
+    db_path = _project_db_path(project_root)
+    if not db_path.exists():
+        return
+    conn = _get_db(db_path)
+    try:
+        conn.execute("DELETE FROM embeddings")
+        conn.executemany(
+            "INSERT INTO embeddings (rel_path, chunk_index, vector) VALUES (?, ?, ?)",
+            embeddings_data,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_embeddings(project_root: str = "", identifier: str = "") -> list[tuple[str, int, bytes]]:
+    """Load pre-computed embeddings from the project DB.
+    Returns list of (rel_path, chunk_index, vector_bytes)."""
+    if identifier:
+        db_path = resolve_project_db(identifier)
+    elif project_root:
+        db_path = _project_db_path(project_root)
+    else:
+        db_path = _find_latest_project_db()
+
+    if not db_path or not db_path.exists():
+        return []
+
+    try:
+        conn = _get_db(db_path)
+        rows = conn.execute("SELECT rel_path, chunk_index, vector FROM embeddings").fetchall()
+        conn.close()
+        return [(r["rel_path"], r["chunk_index"], r["vector"]) for r in rows]
+    except Exception:
+        return []
 
 
 def _get_sessions_db() -> sqlite3.Connection:

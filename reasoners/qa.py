@@ -7,7 +7,7 @@ from skills.storage import load_index, load_session, save_session_turn, list_ind
 
 # Embeddings are optional — degrade gracefully if not installed
 try:
-    from skills.embeddings import build_chunk_embeddings, semantic_search
+    from skills.embeddings import load_and_search
     EMBEDDINGS_AVAILABLE = True
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
@@ -25,7 +25,8 @@ class Answer(BaseModel):
     follow_up: list[str] = Field(description="1-2 follow-up questions the user might want to ask")
 
 
-def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_map: dict) -> dict:
+def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_map: dict,
+                      project_root: str = "") -> dict:
     """
     Hybrid retrieval: BM25 IDF + symbol boosting + optional semantic similarity.
     Returns formatted context with actual source code for the LLM.
@@ -57,15 +58,13 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
             file_path = loc["file"]
             file_scores[file_path] = file_scores.get(file_path, 0) + 5
 
-    # Semantic search boost (if embeddings are available)
+    # Semantic search boost (loads pre-computed embeddings from SQLite)
     if EMBEDDINGS_AVAILABLE and total_files > 0:
         try:
-            chunk_keys, chunk_vectors = build_chunk_embeddings(file_index)
-            if len(chunk_vectors) > 0:
-                sem_results = semantic_search(query, chunk_keys, chunk_vectors, top_k=10)
-                for rel_path, chunk_idx, score in sem_results:
-                    if score > 0.3:  # Only boost meaningfully similar chunks
-                        file_scores[rel_path] = file_scores.get(rel_path, 0) + score * 3
+            sem_results = load_and_search(query, project_root=project_root, top_k=10)
+            for rel_path, chunk_idx, score in sem_results:
+                if score > 0.3:  # Only boost meaningfully similar chunks
+                    file_scores[rel_path] = file_scores.get(rel_path, 0) + score * 3
         except Exception:
             pass  # Graceful degradation — BM25 still works
 
@@ -159,7 +158,7 @@ async def answer_question(question: str, session_id: str = "", project_path: str
             prev_keywords.extend(extract_keywords(turn["question"], top_n=5))
         enriched_query = f"{question} {' '.join(prev_keywords)}"
 
-    retrieved = _retrieve_context(enriched_query, file_index, keyword_map, symbol_map)
+    retrieved = _retrieve_context(enriched_query, file_index, keyword_map, symbol_map, project_root)
 
     # Guard: if no files matched, don't call the LLM with empty context
     if not retrieved["top_files"]:
@@ -220,6 +219,7 @@ async def answer_question(question: str, session_id: str = "", project_path: str
         "relevant_files": retrieved["top_files"],
         "confidence": retrieved["confidence"],
         "session_id": session_id,
+        "project_id": stored.get("project_id", ""),
     }
 
 
@@ -240,8 +240,9 @@ async def find_relevant_files(query: str, project_path: str = "") -> dict:
     file_index = stored["file_index"]
     keyword_map = stored["keyword_map"]
     symbol_map = stored["symbol_map"]
+    project_root = stored["project_root"]
 
-    retrieved = _retrieve_context(query, file_index, keyword_map, symbol_map)
+    retrieved = _retrieve_context(query, file_index, keyword_map, symbol_map, project_root)
 
     # Pure retrieval — no LLM call
     symbol_names = list(retrieved["symbol_hits"].keys())
@@ -256,7 +257,7 @@ async def find_relevant_files(query: str, project_path: str = "") -> dict:
 @qa_router.reasoner()
 async def list_projects() -> dict:
     """
-    List all indexed projects. Pure retrieval, no LLM.
+    List all indexed projects with slug and project_id. Pure retrieval, no LLM.
 
     curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_list_projects \\
       -H "Content-Type: application/json" \\
@@ -266,4 +267,58 @@ async def list_projects() -> dict:
     return {
         "projects": projects,
         "total": len(projects),
+    }
+
+
+@qa_router.reasoner()
+async def get_file_content(file_path: str, project_path: str = "") -> dict:
+    """
+    Get the source code of a specific file from the index.
+    file_path is the relative path within the project (e.g. 'src/main.py').
+    project_path accepts path, slug, or project_id.
+
+    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_get_file_content \\
+      -H "Content-Type: application/json" \\
+      -d '{"input": {"file_path": "skills/storage.py"}}'
+    """
+    stored = load_index(project_path)
+    if not stored:
+        return {"error": "No index found. Run index_project first.", "content": ""}
+
+    file_index = stored["file_index"]
+    project_root = stored["project_root"]
+
+    if file_path not in file_index:
+        return {
+            "error": f"File not found in index: {file_path}",
+            "content": "",
+            "available_files": sorted(file_index.keys())[:20],
+        }
+
+    meta = file_index[file_path]
+    chunks = meta.get("chunks", [])
+
+    # Reassemble content from chunks
+    content = "\n".join(chunk["content"] for chunk in chunks)
+
+    # Try to read fresh from disk if the project is still accessible
+    full_path = Path(project_root) / file_path
+    if full_path.exists():
+        try:
+            from skills.scanner import read_file
+            fresh = read_file(str(full_path))
+            if fresh.get("content"):
+                content = fresh["content"]
+        except Exception:
+            pass  # Fall back to indexed chunks
+
+    return {
+        "file_path": file_path,
+        "project_id": stored.get("project_id", ""),
+        "content": content,
+        "symbols": meta.get("symbols", []),
+        "keywords": meta.get("keywords", []),
+        "extension": meta.get("extension", ""),
+        "size_bytes": meta.get("size_bytes", 0),
+        "chunks_count": len(chunks),
     }

@@ -3,9 +3,16 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from agentfield import AgentRouter
 
-from skills.scanner import scan_directory, read_file, get_changed_files
+from skills.scanner import scan_directory, read_file
 from skills.extractor import extract_symbols, extract_keywords, chunk_file
-from skills.storage import save_index, load_index
+from skills.storage import save_index, load_index, delete_project as storage_delete_project
+
+# Embeddings are optional — built at index time if available
+try:
+    from skills.embeddings import build_and_save_embeddings
+    EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
 
 indexer_router = AgentRouter(prefix="indexer", tags=["indexing"])
 
@@ -92,11 +99,23 @@ async def index_project(project_path: str) -> dict:
     indexed_at = time.time()
     save_index(file_index, keyword_map, symbol_map, project_path, indexed_at)
 
+    # Build and persist embeddings (optional, runs if sentence-transformers is installed)
+    embeddings_count = 0
+    if EMBEDDINGS_AVAILABLE:
+        try:
+            embeddings_count = build_and_save_embeddings(file_index, project_path)
+            indexer_router.app.note(
+                f"Built {embeddings_count} embeddings for semantic search",
+                tags=["indexing", "embeddings"]
+            )
+        except Exception:
+            pass  # Graceful degradation
+
     return IndexResult(
         files_indexed=len(file_index),
         project_root=project_path,
         indexed_at=indexed_at,
-        message=f"Indexed {len(file_index)} files in seconds. Ready to answer questions.",
+        message=f"Indexed {len(file_index)} files ({embeddings_count} embeddings). Ready to answer questions.",
     ).model_dump()
 
 
@@ -223,6 +242,58 @@ async def unwatch_project(project_path: str) -> dict:
     return {
         "stopped": stopped,
         "active_watchers": list_watchers(),
+    }
+
+
+@indexer_router.reasoner()
+async def clone_and_index(github_url: str) -> dict:
+    """
+    Clone a GitHub repository and index it. Accepts full URLs or owner/repo shorthand.
+    If already cloned, pulls latest changes and re-indexes.
+
+    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.indexer_clone_and_index \\
+      -H "Content-Type: application/json" \\
+      -d '{"input": {"github_url": "https://github.com/owner/repo"}}'
+    """
+    from skills.git_ops import clone_repo
+
+    clone_result = clone_repo(github_url)
+    if "error" in clone_result:
+        return {"error": clone_result["error"], "files_indexed": 0}
+
+    project_path = clone_result["path"]
+    index_result = await index_project(project_path)
+
+    return {
+        **index_result,
+        "github_url": github_url,
+        "owner_repo": clone_result.get("owner_repo", ""),
+        "clone_action": clone_result.get("action", ""),
+    }
+
+
+@indexer_router.reasoner()
+async def delete_project(project_identifier: str) -> dict:
+    """
+    Delete an indexed project by path, slug, or project_id.
+
+    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.indexer_delete_project \\
+      -H "Content-Type: application/json" \\
+      -d '{"input": {"project_identifier": "codebase-qa-agent"}}'
+    """
+    deleted = storage_delete_project(project_identifier)
+    if deleted:
+        # Also stop any active watcher
+        try:
+            from skills.watcher import stop_watching
+            stop_watching(project_identifier)
+        except ImportError:
+            pass
+
+    return {
+        "deleted": deleted,
+        "project_identifier": project_identifier,
+        "message": "Project deleted successfully." if deleted else "Project not found.",
     }
 
 

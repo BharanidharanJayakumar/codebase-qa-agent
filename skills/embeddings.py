@@ -2,13 +2,16 @@
 Vector embeddings for semantic search.
 Uses sentence-transformers (all-MiniLM-L6-v2) — runs locally, no API key needed.
 Model loads lazily on first use (~200MB download, then cached).
+
+Embeddings are persisted to SQLite at index time and loaded at query time,
+so we never re-embed the entire index on every question.
 """
-import json
 import numpy as np
 from pathlib import Path
 
 _model = None
 MODEL_NAME = "all-MiniLM-L6-v2"
+VECTOR_DIM = 384  # all-MiniLM-L6-v2 output dimension
 
 
 def _get_model():
@@ -38,38 +41,56 @@ def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray
     return doc_vecs @ query_vec
 
 
-def build_chunk_embeddings(file_index: dict) -> dict:
-    """Build embeddings for all chunks in the file index.
-    Returns {rel_path: [(chunk_index, embedding), ...]}"""
+def build_and_save_embeddings(file_index: dict, project_root: str) -> int:
+    """Build embeddings for all chunks and persist to SQLite.
+    Called at index time. Returns number of chunks embedded."""
+    from skills.storage import save_embeddings
+
     all_texts = []
     all_keys = []  # (rel_path, chunk_index)
 
     for rel_path, meta in file_index.items():
         for i, chunk in enumerate(meta.get("chunks", [])):
-            # Embed a summary: file path + symbol + first few lines
             symbol = chunk.get("symbol") or ""
             text = f"{rel_path} {symbol}\n{chunk['content'][:500]}"
             all_texts.append(text)
             all_keys.append((rel_path, i))
 
     if not all_texts:
-        return {}, np.array([])
+        return 0
 
     vectors = embed_texts(all_texts)
-    return all_keys, vectors
+
+    # Convert to list of (rel_path, chunk_index, vector_bytes) for storage
+    embeddings_data = []
+    for (rel_path, chunk_idx), vec in zip(all_keys, vectors):
+        embeddings_data.append((rel_path, chunk_idx, vec.tobytes()))
+
+    save_embeddings(project_root, embeddings_data)
+    return len(embeddings_data)
 
 
-def semantic_search(query: str, chunk_keys: list, chunk_vectors: np.ndarray,
+def load_and_search(query: str, project_root: str = "", identifier: str = "",
                     top_k: int = 10) -> list[tuple[str, int, float]]:
-    """Search chunks by semantic similarity.
+    """Load persisted embeddings from SQLite and search by semantic similarity.
     Returns [(rel_path, chunk_index, score), ...] sorted by score desc."""
-    if len(chunk_vectors) == 0:
+    from skills.storage import load_embeddings
+
+    rows = load_embeddings(project_root=project_root, identifier=identifier)
+    if not rows:
         return []
 
+    # Reconstruct numpy arrays
+    chunk_keys = []
+    vectors = []
+    for rel_path, chunk_idx, vec_bytes in rows:
+        chunk_keys.append((rel_path, chunk_idx))
+        vectors.append(np.frombuffer(vec_bytes, dtype=np.float32))
+
+    chunk_vectors = np.stack(vectors)
     query_vec = embed_query(query)
     scores = cosine_similarity(query_vec, chunk_vectors)
 
-    # Get top-k indices
     top_indices = np.argsort(scores)[::-1][:top_k]
 
     results = []
