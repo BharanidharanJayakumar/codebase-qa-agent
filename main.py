@@ -32,4 +32,5 @@ app.include_router(indexer_router)
 app.include_router(qa_router)
 
 if __name__ == "__main__":
-    app.serve(auto_port=True, dev=True, reload=False)
+    port = int(os.getenv("PORT", "0"))
+    app.serve(port=port or None, auto_port=port == 0, dev=True, reload=False)
