@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from agentfield import AgentRouter
 
 from skills.extractor import extract_keywords
+from pathlib import Path as _Path
 from skills.storage import load_index, load_session, save_session_turn, list_indexed_projects
 
 # Embeddings are optional — degrade gracefully if not installed
@@ -36,10 +37,16 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
     total_files = len(file_index)
 
     # Direct symbol name matches (strongest signal)
+    # Build a case-insensitive lookup of the symbol map
+    symbol_lower = {k.lower(): v for k, v in symbol_map.items()}
     symbol_hits = {}
     for word in query_words:
-        if word in symbol_map:
-            symbol_hits[word] = symbol_map[word]
+        if word in symbol_lower:
+            symbol_hits[word] = symbol_lower[word]
+        # Also try original-case words from query (user might type exact name)
+    for raw_word in query.split():
+        if raw_word in symbol_map and raw_word.lower() not in symbol_hits:
+            symbol_hits[raw_word.lower()] = symbol_map[raw_word]
 
     # BM25 IDF scoring: rare keywords score higher than common ones
     file_scores: dict[str, float] = {}
@@ -302,7 +309,7 @@ async def get_file_content(file_path: str, project_path: str = "") -> dict:
     content = "\n".join(chunk["content"] for chunk in chunks)
 
     # Try to read fresh from disk if the project is still accessible
-    full_path = Path(project_root) / file_path
+    full_path = _Path(project_root) / file_path
     if full_path.exists():
         try:
             from skills.scanner import read_file
@@ -322,3 +329,38 @@ async def get_file_content(file_path: str, project_path: str = "") -> dict:
         "size_bytes": meta.get("size_bytes", 0),
         "chunks_count": len(chunks),
     }
+
+
+@qa_router.reasoner()
+async def list_project_files(project_path: str = "") -> dict:
+    """
+    List ALL files in an indexed project. Returns the full directory tree.
+    Pure retrieval, no LLM. Use for populating a file explorer UI.
+    """
+    stored = load_index(project_path)
+    if not stored:
+        return {"files": [], "total": 0, "error": "No index found."}
+
+    file_index = stored["file_index"]
+    files = [
+        {
+            "relative_path": rel_path,
+            "extension": meta.get("extension", ""),
+            "size_bytes": meta.get("size_bytes", 0),
+        }
+        for rel_path, meta in sorted(file_index.items())
+    ]
+    return {"files": files, "total": len(files)}
+
+
+@qa_router.reasoner()
+async def get_session_history(session_id: str) -> dict:
+    """
+    Load conversation history for a session. Returns all Q&A turns.
+    Used to restore chat history when user returns to a project.
+    """
+    if not session_id:
+        return {"turns": [], "session_id": ""}
+
+    turns = load_session(session_id, max_turns=50)
+    return {"turns": turns, "session_id": session_id}
