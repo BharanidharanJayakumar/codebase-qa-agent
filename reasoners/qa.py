@@ -110,11 +110,25 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
                 f"at line {loc['line']} ({loc['type']})]"
             )
 
-    # Meaningful confidence based on score quality, not file count
+    # Confidence based on multiple signals, not just score ratio
     top_score = ranked[0][1] if ranked else 0
     max_possible = len(query_keywords) * math.log(total_files + 1) + 5 if total_files else 1
     ratio = top_score / max_possible if max_possible > 0 else 0
-    confidence = "high" if ratio >= 0.3 else "medium" if ratio >= 0.1 else "low"
+
+    # Additional confidence signals
+    has_symbol_hits = len(symbol_hits) > 0
+    matching_file_count = len(ranked)
+    keyword_coverage = len([f for f, s in ranked if s > 0]) / max(total_files, 1)
+
+    # Symbol hits are strong indicators — boost confidence
+    if has_symbol_hits and matching_file_count >= 1:
+        confidence = "high"
+    elif ratio >= 0.15 or (matching_file_count >= 3 and ratio >= 0.08):
+        confidence = "high"
+    elif ratio >= 0.05 or matching_file_count >= 2:
+        confidence = "medium"
+    else:
+        confidence = "low"
 
     return {
         "context": "\n\n".join(context_parts),
