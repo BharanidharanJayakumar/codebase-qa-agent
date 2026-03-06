@@ -239,6 +239,7 @@ async def answer_question(question: str, session_id: str = "", project_path: str
         **result.model_dump(),
         "relevant_files": retrieved["top_files"],
         "confidence": retrieved["confidence"],
+        "top_score": retrieved.get("top_score", 0),
         "session_id": session_id,
         "project_id": stored.get("project_id", ""),
     }
