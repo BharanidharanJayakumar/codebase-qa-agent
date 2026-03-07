@@ -266,6 +266,7 @@ async def clone_and_index(github_url: str) -> dict:
 
     return {
         **index_result,
+        "project_root": project_path,
         "github_url": github_url,
         "owner_repo": clone_result.get("owner_repo", ""),
         "clone_action": clone_result.get("action", ""),
