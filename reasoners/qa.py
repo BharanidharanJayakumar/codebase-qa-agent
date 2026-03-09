@@ -338,6 +338,7 @@ async def get_file_content(file_path: str, project_path: str = "") -> dict:
         "file_path": file_path,
         "project_id": stored.get("project_id", ""),
         "content": content,
+        "line_count": content.count("\n") + 1 if content else 0,
         "symbols": meta.get("symbols", []),
         "keywords": meta.get("keywords", []),
         "extension": meta.get("extension", ""),
