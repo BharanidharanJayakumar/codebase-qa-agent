@@ -380,3 +380,55 @@ async def get_session_history(session_id: str) -> dict:
 
     turns = load_session(session_id, max_turns=50)
     return {"turns": turns, "session_id": session_id}
+
+
+@qa_router.reasoner()
+async def search_code(query: str, project_path: str = "") -> dict:
+    """
+    Grep-like code search across indexed files. Returns matching lines
+    with file path and line numbers. Pure retrieval, no LLM.
+
+    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_search_code \\
+      -H "Content-Type: application/json" \\
+      -d '{"input": {"query": "def authenticate", "project_path": ""}}'
+    """
+    import re
+    stored = load_index(project_path)
+    if not stored:
+        return {"matches": [], "total": 0, "error": "No index found."}
+
+    file_index = stored["file_index"]
+    project_root = stored["project_root"]
+    matches = []
+
+    try:
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+    except re.error:
+        return {"matches": [], "total": 0, "error": "Invalid search pattern."}
+
+    for rel_path, meta in file_index.items():
+        chunks = meta.get("chunks", [])
+        content = "\n".join(c["content"] for c in chunks)
+
+        # Try fresh from disk
+        full_path = _Path(project_root) / rel_path
+        if full_path.exists():
+            try:
+                from skills.scanner import read_file
+                fresh = read_file(str(full_path))
+                if fresh.get("content"):
+                    content = fresh["content"]
+            except Exception:
+                pass
+
+        for i, line in enumerate(content.split("\n"), 1):
+            if pattern.search(line):
+                matches.append({
+                    "file": rel_path,
+                    "line": i,
+                    "text": line.strip(),
+                })
+                if len(matches) >= 50:
+                    return {"matches": matches, "total": len(matches), "truncated": True}
+
+    return {"matches": matches, "total": len(matches)}
