@@ -2,6 +2,7 @@
 Git operations for cloning repositories from GitHub URLs.
 Clones to a managed directory so indexed repos persist across sessions.
 """
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -41,11 +42,12 @@ def clone_repo(url: str) -> dict:
     target_dir = REPOS_DIR / repo_name
 
     # If already cloned, pull latest
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     if target_dir.exists() and (target_dir / ".git").exists():
         try:
             subprocess.run(
                 ["git", "-C", str(target_dir), "pull", "--ff-only"],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=120, env=env,
             )
             return {"path": str(target_dir), "owner_repo": owner_repo, "action": "updated"}
         except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
@@ -56,7 +58,7 @@ def clone_repo(url: str) -> dict:
     try:
         result = subprocess.run(
             ["git", "clone", "--depth", "1", clone_url, str(target_dir)],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=300, env=env,
         )
         if result.returncode != 0:
             return {"error": f"git clone failed: {result.stderr.strip()}"}
