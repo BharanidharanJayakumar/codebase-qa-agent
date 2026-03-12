@@ -1,22 +1,21 @@
-import math
+"""
+QA orchestrator agent — classifies query intent, delegates to retrieval or summary agents,
+then synthesizes answers via LLM.
+"""
+import json
+import re
 from pydantic import BaseModel, Field
 from agentfield import AgentRouter
 
 from skills.extractor import extract_keywords
+from skills.storage import (
+    load_index, load_session, save_session_turn, list_indexed_projects,
+    load_project_summary, load_symbol_categories, load_file_imports,
+)
 from pathlib import Path as _Path
-from skills.storage import load_index, load_session, save_session_turn, list_indexed_projects
-
-# Embeddings are optional — degrade gracefully if not installed
-try:
-    from skills.embeddings import load_and_search
-    EMBEDDINGS_AVAILABLE = True
-except ImportError:
-    EMBEDDINGS_AVAILABLE = False
+from reasoners.retrieval import retrieve_context
 
 qa_router = AgentRouter(prefix="qa", tags=["question-answering"])
-
-MIN_SCORE = 0.5  # Minimum BM25 score to consider a file relevant
-MAX_CONTEXT_CHARS = 24_000  # ~6000 tokens — fits comfortably in 8K context window
 
 
 class Answer(BaseModel):
@@ -26,116 +25,127 @@ class Answer(BaseModel):
     follow_up: list[str] = Field(description="1-2 follow-up questions the user might want to ask")
 
 
-def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_map: dict,
-                      project_root: str = "") -> dict:
-    """
-    Hybrid retrieval: BM25 IDF + symbol boosting + optional semantic similarity.
-    Returns formatted context with actual source code for the LLM.
-    """
-    query_keywords = extract_keywords(query, top_n=10)
-    query_words = query.lower().split()
-    total_files = len(file_index)
+# ── Intent classification ────────────────────────────────────────────────────
 
-    # Direct symbol name matches (strongest signal)
-    # Build a case-insensitive lookup of the symbol map
-    symbol_lower = {k.lower(): v for k, v in symbol_map.items()}
-    symbol_hits = {}
-    for word in query_words:
-        if word in symbol_lower:
-            symbol_hits[word] = symbol_lower[word]
-        # Also try original-case words from query (user might type exact name)
-    for raw_word in query.split():
-        if raw_word in symbol_map and raw_word.lower() not in symbol_hits:
-            symbol_hits[raw_word.lower()] = symbol_map[raw_word]
+AGGREGATE_PATTERNS = [
+    re.compile(r"\bhow many\b", re.IGNORECASE),
+    re.compile(r"\bcount\b.*\b(dto|route|test|service|model|endpoint|controller|middleware|config)", re.IGNORECASE),
+    re.compile(r"\blist\s+(all|every)\b", re.IGNORECASE),
+    re.compile(r"\ball\s+(dto|route|test|service|model|endpoint|controller|middleware)", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(dto|route|test|service|model|endpoint|api)\s*s?\b", re.IGNORECASE),
+    re.compile(r"\bshow\s+(me\s+)?(all|every)\b", re.IGNORECASE),
+    re.compile(r"\bwhere\s+are\s+(the\s+)?(all|every)\b", re.IGNORECASE),
+]
 
-    # BM25 IDF scoring: rare keywords score higher than common ones
-    file_scores: dict[str, float] = {}
-    for kw in query_keywords:
-        files_with_kw = keyword_map.get(kw, [])
-        if not files_with_kw:
-            continue
-        df = len(files_with_kw)
-        idf = math.log((total_files - df + 0.5) / (df + 0.5) + 1)
-        for file_path in files_with_kw:
-            file_scores[file_path] = file_scores.get(file_path, 0) + idf
+OVERVIEW_PATTERNS = [
+    re.compile(r"\bwhat\s+(is|does)\s+this\s+(project|app|repo|codebase)\b", re.IGNORECASE),
+    re.compile(r"\boverview\b", re.IGNORECASE),
+    re.compile(r"\bsummar(y|ize)\b", re.IGNORECASE),
+    re.compile(r"\barchitecture\b", re.IGNORECASE),
+    re.compile(r"\btech\s*stack\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+language", re.IGNORECASE),
+    re.compile(r"\bwhat\s+framework", re.IGNORECASE),
+    re.compile(r"\bdirectory\s+structure\b", re.IGNORECASE),
+    re.compile(r"\bproject\s+structure\b", re.IGNORECASE),
+    re.compile(r"\btell\s+me\s+about\s+this\b", re.IGNORECASE),
+]
 
-    # Boost all files with direct symbol hits (one-to-many)
-    for sym_name, locations in symbol_hits.items():
-        for loc in locations:
-            file_path = loc["file"]
-            file_scores[file_path] = file_scores.get(file_path, 0) + 5
 
-    # Semantic search boost (loads pre-computed embeddings from SQLite)
-    if EMBEDDINGS_AVAILABLE and total_files > 0:
-        try:
-            sem_results = load_and_search(query, project_root=project_root, top_k=10)
-            for rel_path, chunk_idx, score in sem_results:
-                if score > 0.3:  # Only boost meaningfully similar chunks
-                    file_scores[rel_path] = file_scores.get(rel_path, 0) + score * 3
-        except Exception:
-            pass  # Graceful degradation — BM25 still works
+def _classify_query(question: str) -> str:
+    """Classify query intent: 'aggregate', 'overview', or 'code_specific'."""
+    for pattern in AGGREGATE_PATTERNS:
+        if pattern.search(question):
+            return "aggregate"
+    for pattern in OVERVIEW_PATTERNS:
+        if pattern.search(question):
+            return "overview"
+    return "code_specific"
 
-    # Filter by minimum score, then take top 5
-    ranked = [(p, s) for p, s in file_scores.items() if s >= MIN_SCORE]
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    top_files = [path for path, _ in ranked[:5]]
 
-    # Build context from semantic chunks with token budget enforcement.
-    # Pack chunks in order of file relevance until we hit MAX_CONTEXT_CHARS.
-    context_parts = []
-    chars_used = 0
-    for file_path in top_files:
-        meta = file_index.get(file_path, {})
-        chunks = meta.get("chunks", [])
-        if not chunks:
-            continue
-        for chunk in chunks:
-            sym_label = f" ({chunk['symbol']})" if chunk.get("symbol") else ""
-            part = (
-                f"=== {file_path} [lines {chunk['start_line']}-{chunk['end_line']}]{sym_label} ===\n"
-                f"{chunk['content']}"
-            )
-            if chars_used + len(part) > MAX_CONTEXT_CHARS:
-                break  # Budget exhausted — stop packing
-            context_parts.append(part)
-            chars_used += len(part)
-        if chars_used >= MAX_CONTEXT_CHARS:
+def _retrieve_aggregate(question: str, project_path: str) -> dict:
+    """Retrieve aggregated data from symbol_categories for aggregate queries."""
+    question_lower = question.lower()
+
+    # Detect which category the user is asking about
+    category_map = {
+        "dto": "dto", "dtos": "dto", "model": "dto", "models": "dto",
+        "schema": "dto", "entity": "dto", "entities": "dto",
+        "route": "route", "routes": "route", "endpoint": "route", "endpoints": "route",
+        "api": "route", "controller": "route", "controllers": "route",
+        "test": "test", "tests": "test", "spec": "test", "specs": "test",
+        "service": "service", "services": "service",
+        "config": "config", "configuration": "config",
+        "middleware": "middleware",
+    }
+
+    target_category = None
+    for keyword, cat in category_map.items():
+        if keyword in question_lower:
+            target_category = cat
             break
 
-    # Add symbol location hints (small, always fits)
-    for sym_name, locations in symbol_hits.items():
-        for loc in locations:
-            context_parts.append(
-                f"\n[Symbol `{sym_name}` defined in {loc['file']} "
-                f"at line {loc['line']} ({loc['type']})]"
-            )
+    rows = load_symbol_categories(project_path, category=target_category)
 
-    # Confidence based on multiple signals, not just score ratio
-    top_score = ranked[0][1] if ranked else 0
-    max_possible = len(query_keywords) * math.log(total_files + 1) + 5 if total_files else 1
-    ratio = top_score / max_possible if max_possible > 0 else 0
+    # Group by category
+    grouped: dict[str, list[dict]] = {}
+    for rel_path, symbol_name, cat, detail in rows:
+        grouped.setdefault(cat, [])
+        grouped[cat].append({"file": rel_path, "symbol": symbol_name, "detail": detail})
 
-    # Additional confidence signals
-    has_symbol_hits = len(symbol_hits) > 0
-    matching_file_count = len(ranked)
-    keyword_coverage = len([f for f, s in ranked if s > 0]) / max(total_files, 1)
-
-    # Symbol hits are strong indicators — boost confidence
-    if has_symbol_hits and matching_file_count >= 1:
-        confidence = "high"
-    elif ratio >= 0.15 or (matching_file_count >= 3 and ratio >= 0.08):
-        confidence = "high"
-    elif ratio >= 0.05 or matching_file_count >= 2:
-        confidence = "medium"
-    else:
-        confidence = "low"
+    # Build context string for the LLM
+    parts = []
+    for cat, items in grouped.items():
+        parts.append(f"\n=== {cat.upper()} ({len(items)} found) ===")
+        for item in items[:30]:  # cap per category
+            parts.append(f"  {item['symbol']} in {item['file']} ({item['detail']})")
 
     return {
-        "context": "\n\n".join(context_parts),
-        "top_files": top_files,
-        "symbol_hits": symbol_hits,
-        "confidence": confidence,
-        "top_score": top_score,
+        "context": "\n".join(parts),
+        "categories": grouped,
+        "total": sum(len(v) for v in grouped.values()),
+        "filter": target_category,
+    }
+
+
+def _retrieve_overview(project_path: str) -> dict:
+    """Retrieve project summary for overview queries."""
+    raw_summary = load_project_summary(project_path)
+    if not raw_summary:
+        return {"context": "", "summary": {}}
+
+    summary = {}
+    for key, value in raw_summary.items():
+        try:
+            summary[key] = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            summary[key] = value
+
+    # Build context string for the LLM
+    parts = []
+    if summary.get("project_description"):
+        parts.append(f"Project description: {summary['project_description']}")
+    if summary.get("languages"):
+        lang_str = ", ".join(f"{k}: {v} files" for k, v in summary["languages"].items())
+        parts.append(f"Languages: {lang_str}")
+    if summary.get("framework_hints"):
+        parts.append(f"Frameworks: {', '.join(summary['framework_hints'])}")
+    if summary.get("total_symbols"):
+        sym_str = ", ".join(f"{v} {k}s" for k, v in summary["total_symbols"].items())
+        parts.append(f"Symbols: {sym_str}")
+    if summary.get("total_lines"):
+        parts.append(f"Total lines of code: {summary['total_lines']}")
+    if summary.get("dependency_files"):
+        parts.append(f"Dependency files: {', '.join(summary['dependency_files'])}")
+    if summary.get("directory_tree"):
+        tree = summary["directory_tree"]
+        dirs = ", ".join(f"{k}/ ({v['files']} files)" for k, v in list(tree.items())[:15])
+        parts.append(f"Top directories: {dirs}")
+    if summary.get("readme_content"):
+        parts.append(f"\nREADME:\n{summary['readme_content'][:2000]}")
+
+    return {
+        "context": "\n".join(parts),
+        "summary": summary,
     }
 
 
@@ -143,12 +153,7 @@ def _retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_ma
 async def answer_question(question: str, session_id: str = "", project_path: str = "") -> dict:
     """
     Answer any question about the indexed codebase.
-    Pass a session_id to enable follow-up questions with conversation memory.
-    Pass a project_path to query a specific project (defaults to most recently indexed).
-
-    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_answer_question \\
-      -H "Content-Type: application/json" \\
-      -d '{"input": {"question": "How does authentication work?", "session_id": "s1"}}'
+    Classifies intent (aggregate/overview/code-specific) and retrieves accordingly.
     """
     stored = load_index(project_path)
     if not stored:
@@ -165,27 +170,55 @@ async def answer_question(question: str, session_id: str = "", project_path: str
     symbol_map = stored["symbol_map"]
     project_root = stored["project_root"]
 
-    # Load conversation history if session_id provided
+    # Load conversation history
     history = load_session(session_id) if session_id else []
 
-    # For follow-up questions, enrich the query with context from previous turns
-    # so BM25 retrieval can find relevant files even for vague follow-ups like "what about its tests?"
+    # Classify query intent
+    intent = _classify_query(question)
+
+    # Enrich query for follow-ups
     enriched_query = question
     if history:
-        prev_files = []
         prev_keywords = []
-        for turn in history[-2:]:  # last 2 turns for keyword enrichment
-            prev_files.extend(turn.get("relevant_files", []))
+        for turn in history[-2:]:
             prev_keywords.extend(extract_keywords(turn["question"], top_n=5))
         enriched_query = f"{question} {' '.join(prev_keywords)}"
 
-    retrieved = _retrieve_context(enriched_query, file_index, keyword_map, symbol_map, project_root)
+    # Route retrieval based on intent
+    retrieved_context = ""
+    top_files = []
+    confidence = "medium"
+    extra_data = {}
 
-    # Guard: if no files matched, don't call the LLM with empty context
-    if not retrieved["top_files"]:
+    if intent == "aggregate":
+        agg = _retrieve_aggregate(enriched_query, project_root)
+        retrieved_context = agg["context"]
+        confidence = "high" if agg["total"] > 0 else "low"
+        extra_data["aggregate_total"] = agg["total"]
+        extra_data["aggregate_filter"] = agg["filter"]
+        # Also get some code context for richer answers
+        code_ctx = retrieve_context(enriched_query, file_index, keyword_map, symbol_map, project_root)
+        top_files = code_ctx["top_files"]
+        if code_ctx["context"]:
+            retrieved_context += "\n\nRelevant source code:\n" + code_ctx["context"][:8000]
+
+    elif intent == "overview":
+        overview = _retrieve_overview(project_root)
+        retrieved_context = overview["context"]
+        confidence = "high" if overview["context"] else "low"
+        extra_data["summary"] = overview.get("summary", {})
+
+    else:  # code_specific
+        code_ctx = retrieve_context(enriched_query, file_index, keyword_map, symbol_map, project_root)
+        retrieved_context = code_ctx["context"]
+        top_files = code_ctx["top_files"]
+        confidence = code_ctx["confidence"]
+
+    # Guard: if no context found
+    if not retrieved_context.strip():
         return {
             "answer": (
-                "No relevant files found for this question. "
+                "No relevant information found for this question. "
                 "Try using specific function names, class names, or file names from the codebase."
             ),
             "relevant_files": [],
@@ -194,11 +227,11 @@ async def answer_question(question: str, session_id: str = "", project_path: str
             "session_id": session_id,
         }
 
-    # Build conversation history for the LLM prompt
+    # Build conversation history block
     history_block = ""
     if history:
         parts = []
-        for turn in history[-3:]:  # last 3 turns max
+        for turn in history[-3:]:
             parts.append(f"Q: {turn['question']}\nA: {turn['answer']}")
         history_block = (
             "Previous conversation:\n"
@@ -206,67 +239,74 @@ async def answer_question(question: str, session_id: str = "", project_path: str
             + "\n\n---\nNow answer the follow-up question below.\n\n"
         )
 
+    # Build intent-aware system prompt
+    intent_hints = {
+        "aggregate": (
+            "The user is asking an aggregate/counting question. "
+            "Use the categorized symbol data provided to give precise counts and lists. "
+            "Be specific about file locations."
+        ),
+        "overview": (
+            "The user is asking about the project overview/architecture. "
+            "Use the project summary data to give a comprehensive overview. "
+            "Cover languages, frameworks, structure, and purpose."
+        ),
+        "code_specific": (
+            "The user is asking about specific code. "
+            "Use the source code context to give a detailed, accurate answer. "
+            "Mention file names, function names, and line numbers."
+        ),
+    }
+
     result = await qa_router.ai(
         system=(
             "You are an expert software engineer helping a developer understand a codebase. "
             f"The project is at: {project_root}\n"
-            "Answer questions using the actual source code provided. "
-            "Be specific — mention file names, function names, and line numbers when you know them. "
-            "If the context is insufficient, say so clearly."
+            f"{intent_hints.get(intent, '')}\n"
+            "Answer questions using the data and source code provided. "
+            "Be specific and accurate. If the context is insufficient, say so clearly."
         ),
         user=(
             f"{history_block}"
             f"Question: {question}\n\n"
-            f"Relevant source code from the codebase:\n\n"
-            f"{retrieved['context']}"
+            f"Data from the codebase:\n\n"
+            f"{retrieved_context}"
         ),
         schema=Answer,
     )
 
-    # Save this turn to the session
+    # Save this turn
     if session_id:
-        save_session_turn(
-            session_id, question,
-            result.answer, retrieved["top_files"]
-        )
+        save_session_turn(session_id, question, result.answer, top_files)
 
     qa_router.app.note(
-        f"Q: {question[:80]} | Files: {retrieved['top_files']} | Confidence: {retrieved['confidence']}",
+        f"Q: {question[:80]} | Intent: {intent} | Files: {top_files} | Confidence: {confidence}",
         tags=["qa", "query"]
     )
 
     return {
         **result.model_dump(),
-        "relevant_files": retrieved["top_files"],
-        "confidence": retrieved["confidence"],
-        "top_score": retrieved.get("top_score", 0),
+        "relevant_files": top_files,
+        "confidence": confidence,
         "session_id": session_id,
         "project_id": stored.get("project_id", ""),
+        "intent": intent,
+        **extra_data,
     }
 
 
 @qa_router.reasoner()
 async def find_relevant_files(query: str, project_path: str = "") -> dict:
-    """
-    Return the most relevant files for a topic — pure keyword retrieval, no LLM.
-    Genuinely instant response.
-
-    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_find_relevant_files \\
-      -H "Content-Type: application/json" \\
-      -d '{"input": {"query": "authentication jwt token"}}'
-    """
+    """Return the most relevant files for a topic — pure keyword retrieval, no LLM."""
     stored = load_index(project_path)
     if not stored:
         return {"files": [], "reasoning": "No index found. Run index_project first."}
 
-    file_index = stored["file_index"]
-    keyword_map = stored["keyword_map"]
-    symbol_map = stored["symbol_map"]
-    project_root = stored["project_root"]
+    retrieved = retrieve_context(
+        query, stored["file_index"], stored["keyword_map"],
+        stored["symbol_map"], stored["project_root"],
+    )
 
-    retrieved = _retrieve_context(query, file_index, keyword_map, symbol_map, project_root)
-
-    # Pure retrieval — no LLM call
     symbol_names = list(retrieved["symbol_hits"].keys())
     return {
         "files": retrieved["top_files"],
@@ -278,31 +318,14 @@ async def find_relevant_files(query: str, project_path: str = "") -> dict:
 
 @qa_router.reasoner()
 async def list_projects() -> dict:
-    """
-    List all indexed projects with slug and project_id. Pure retrieval, no LLM.
-
-    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_list_projects \\
-      -H "Content-Type: application/json" \\
-      -d '{"input": {}}'
-    """
+    """List all indexed projects."""
     projects = list_indexed_projects()
-    return {
-        "projects": projects,
-        "total": len(projects),
-    }
+    return {"projects": projects, "total": len(projects)}
 
 
 @qa_router.reasoner()
 async def get_file_content(file_path: str, project_path: str = "") -> dict:
-    """
-    Get the source code of a specific file from the index.
-    file_path is the relative path within the project (e.g. 'src/main.py').
-    project_path accepts path, slug, or project_id.
-
-    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_get_file_content \\
-      -H "Content-Type: application/json" \\
-      -d '{"input": {"file_path": "skills/storage.py"}}'
-    """
+    """Get the source code of a specific file from the index."""
     stored = load_index(project_path)
     if not stored:
         return {"error": "No index found. Run index_project first.", "content": ""}
@@ -319,11 +342,8 @@ async def get_file_content(file_path: str, project_path: str = "") -> dict:
 
     meta = file_index[file_path]
     chunks = meta.get("chunks", [])
-
-    # Reassemble content from chunks
     content = "\n".join(chunk["content"] for chunk in chunks)
 
-    # Try to read fresh from disk if the project is still accessible
     full_path = _Path(project_root) / file_path
     if full_path.exists():
         try:
@@ -332,7 +352,7 @@ async def get_file_content(file_path: str, project_path: str = "") -> dict:
             if fresh.get("content"):
                 content = fresh["content"]
         except Exception:
-            pass  # Fall back to indexed chunks
+            pass
 
     return {
         "file_path": file_path,
@@ -349,10 +369,7 @@ async def get_file_content(file_path: str, project_path: str = "") -> dict:
 
 @qa_router.reasoner()
 async def list_project_files(project_path: str = "") -> dict:
-    """
-    List ALL files in an indexed project. Returns the full directory tree.
-    Pure retrieval, no LLM. Use for populating a file explorer UI.
-    """
+    """List ALL files in an indexed project for file explorer UI."""
     stored = load_index(project_path)
     if not stored:
         return {"files": [], "total": 0, "error": "No index found."}
@@ -371,28 +388,17 @@ async def list_project_files(project_path: str = "") -> dict:
 
 @qa_router.reasoner()
 async def get_session_history(session_id: str) -> dict:
-    """
-    Load conversation history for a session. Returns all Q&A turns.
-    Used to restore chat history when user returns to a project.
-    """
+    """Load conversation history for a session."""
     if not session_id:
         return {"turns": [], "session_id": ""}
-
     turns = load_session(session_id, max_turns=50)
     return {"turns": turns, "session_id": session_id}
 
 
 @qa_router.reasoner()
 async def search_code(query: str, project_path: str = "") -> dict:
-    """
-    Grep-like code search across indexed files. Returns matching lines
-    with file path and line numbers. Pure retrieval, no LLM.
-
-    curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.qa_search_code \\
-      -H "Content-Type: application/json" \\
-      -d '{"input": {"query": "def authenticate", "project_path": ""}}'
-    """
-    import re
+    """Grep-like code search across indexed files."""
+    import re as _re
     stored = load_index(project_path)
     if not stored:
         return {"matches": [], "total": 0, "error": "No index found."}
@@ -402,15 +408,14 @@ async def search_code(query: str, project_path: str = "") -> dict:
     matches = []
 
     try:
-        pattern = re.compile(re.escape(query), re.IGNORECASE)
-    except re.error:
+        pattern = _re.compile(_re.escape(query), _re.IGNORECASE)
+    except _re.error:
         return {"matches": [], "total": 0, "error": "Invalid search pattern."}
 
     for rel_path, meta in file_index.items():
         chunks = meta.get("chunks", [])
         content = "\n".join(c["content"] for c in chunks)
 
-        # Try fresh from disk
         full_path = _Path(project_root) / rel_path
         if full_path.exists():
             try:
@@ -423,11 +428,7 @@ async def search_code(query: str, project_path: str = "") -> dict:
 
         for i, line in enumerate(content.split("\n"), 1):
             if pattern.search(line):
-                matches.append({
-                    "file": rel_path,
-                    "line": i,
-                    "text": line.strip(),
-                })
+                matches.append({"file": rel_path, "line": i, "text": line.strip()})
                 if len(matches) >= 50:
                     return {"matches": matches, "total": len(matches), "truncated": True}
 

@@ -6,6 +6,7 @@ from agentfield import AgentRouter
 from skills.scanner import scan_directory, read_file
 from skills.extractor import extract_symbols, extract_keywords, chunk_file
 from skills.storage import save_index, load_index, delete_project as storage_delete_project
+from skills.aggregator import build_project_summary, extract_imports, categorize_symbols
 
 # Embeddings are optional — built at index time if available
 try:
@@ -56,6 +57,9 @@ async def index_project(project_path: str) -> dict:
     file_index = {}    # rel_path → {chunks, keywords, symbols, ...}
     keyword_map = {}   # keyword → [rel_paths]
     symbol_map = {}    # symbol_name → [{file, line, type}, ...]
+    all_imports = []   # (source_path, imported_name, target_path|None)
+    all_categories = []  # (rel_path, symbol_name, category, detail)
+    project_files = {f["relative_path"] for f in files}
 
     for file_meta in files:
         path = file_meta["path"]
@@ -91,13 +95,28 @@ async def index_project(project_path: str) -> dict:
             "last_modified": file_meta["last_modified"],
         }
 
+        # Extract imports and categorize symbols for project-level intelligence
+        file_imports = extract_imports(content, rel_path, project_files)
+        all_imports.extend(file_imports)
+
+        file_categories = categorize_symbols(rel_path, content, symbols)
+        all_categories.extend(file_categories)
+
         indexer_router.app.note(
             f"Indexed: {rel_path} [{len(symbols)} symbols, {len(chunks)} chunks]",
             tags=["indexing", "progress"]
         )
 
+    # Build project-level summary (languages, frameworks, dir tree, etc.)
+    project_summary = build_project_summary(project_path, file_index, symbol_map)
+
     indexed_at = time.time()
-    save_index(file_index, keyword_map, symbol_map, project_path, indexed_at)
+    save_index(
+        file_index, keyword_map, symbol_map, project_path, indexed_at,
+        project_summary=project_summary,
+        imports_data=all_imports,
+        categories_data=all_categories,
+    )
 
     # Build and persist embeddings (optional, runs if sentence-transformers is installed)
     embeddings_count = 0
@@ -182,8 +201,35 @@ async def update_index(project_path: str) -> dict:
 
         indexer_router.app.note(f"Updated: {rel_path}", tags=["update"])
 
+    # Rebuild project-level intelligence after update
+    all_imports = []
+    all_categories = []
+    all_project_files = set(file_index.keys())
+
+    for rel_path, meta in file_index.items():
+        fpath = Path(project_root) / rel_path
+        if not fpath.exists():
+            continue
+        try:
+            content = fpath.read_text(errors="replace")
+        except Exception:
+            continue
+
+        symbols = extract_symbols(content, str(fpath))
+        file_imports = extract_imports(content, rel_path, all_project_files)
+        all_imports.extend(file_imports)
+        file_categories = categorize_symbols(rel_path, content, symbols)
+        all_categories.extend(file_categories)
+
+    project_summary = build_project_summary(project_root, file_index, symbol_map)
+
     new_timestamp = time.time()
-    save_index(file_index, keyword_map, symbol_map, project_root, new_timestamp)
+    save_index(
+        file_index, keyword_map, symbol_map, project_root, new_timestamp,
+        project_summary=project_summary,
+        imports_data=all_imports,
+        categories_data=all_categories,
+    )
 
     return {
         "files_updated": len(changed),

@@ -8,6 +8,8 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from reasoners.indexer import indexer_router
 from reasoners.qa import qa_router
+from reasoners.summary import summary_router
+from reasoners.retrieval import retrieval_router
 
 app = Agent(
     node_id="codebase-qa-agent",
@@ -30,6 +32,8 @@ app = Agent(
 # This is like mounting blueprints in Flask or routers in FastAPI
 app.include_router(indexer_router)
 app.include_router(qa_router)
+app.include_router(summary_router)
+app.include_router(retrieval_router)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "0"))

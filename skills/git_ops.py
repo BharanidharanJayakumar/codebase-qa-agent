@@ -35,7 +35,10 @@ def clone_repo(url: str) -> dict:
     Returns {"path": str, "owner_repo": str} on success, {"error": str} on failure."""
     owner_repo = parse_github_url(url)
     if not owner_repo:
-        return {"error": f"Invalid GitHub URL: {url}. Expected format: https://github.com/owner/repo"}
+        return {
+            "error": f"Invalid GitHub URL: {url}. Expected format: https://github.com/owner/repo",
+            "error_type": "invalid_url",
+        }
 
     clone_url = f"https://github.com/{owner_repo}.git"
     repo_name = owner_repo.replace("/", "_")
@@ -51,7 +54,7 @@ def clone_repo(url: str) -> dict:
             )
             return {"path": str(target_dir), "owner_repo": owner_repo, "action": "updated"}
         except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
-            return {"error": f"Failed to update {owner_repo}: {e}"}
+            return {"error": f"Failed to update {owner_repo}: {e}", "error_type": "update_failed"}
 
     # Fresh clone
     REPOS_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,9 +64,17 @@ def clone_repo(url: str) -> dict:
             capture_output=True, text=True, timeout=300, env=env,
         )
         if result.returncode != 0:
-            return {"error": f"git clone failed: {result.stderr.strip()}"}
+            stderr = result.stderr.strip()
+            # Detect private/inaccessible repos
+            if "not found" in stderr.lower() or "authentication" in stderr.lower() or "could not read" in stderr.lower():
+                return {
+                    "error": f"Repository not accessible: {owner_repo}",
+                    "error_type": "repo_not_accessible",
+                    "owner_repo": owner_repo,
+                }
+            return {"error": f"git clone failed: {stderr}", "error_type": "clone_failed"}
         return {"path": str(target_dir), "owner_repo": owner_repo, "action": "cloned"}
     except subprocess.TimeoutExpired:
-        return {"error": f"Clone timed out for {owner_repo} (5min limit)"}
+        return {"error": f"Clone timed out for {owner_repo} (5min limit)", "error_type": "timeout"}
     except FileNotFoundError:
-        return {"error": "git is not installed. Install git and try again."}
+        return {"error": "git is not installed. Install git and try again.", "error_type": "git_not_installed"}

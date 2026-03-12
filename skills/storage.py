@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 INDEX_DIR = Path.home() / ".codebase-qa-agent"
 DB_FILE = INDEX_DIR / "index.db"  # legacy single-project path
 # Keep the old JSON path for migration
@@ -94,11 +94,37 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chunks_rel_path ON chunks(rel_path);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_keyword_files_keyword ON keyword_files(keyword);
+
+        -- v6: Project-level intelligence tables
+        CREATE TABLE IF NOT EXISTS project_summary (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS file_imports (
+            source_path TEXT NOT NULL,
+            imported_name TEXT NOT NULL,
+            target_path TEXT,
+            PRIMARY KEY (source_path, imported_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS symbol_categories (
+            rel_path TEXT NOT NULL,
+            symbol_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            detail TEXT,
+            PRIMARY KEY (rel_path, symbol_name, category)
+        );
+        CREATE INDEX IF NOT EXISTS idx_symbol_categories_cat ON symbol_categories(category);
+        CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(target_path);
     """)
 
 
 def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
-               project_root: str, indexed_at: float) -> None:
+               project_root: str, indexed_at: float,
+               project_summary: dict | None = None,
+               imports_data: list[tuple] | None = None,
+               categories_data: list[tuple] | None = None) -> None:
     """Save the full index to a per-project SQLite database."""
     db_path = _project_db_path(project_root)
     conn = _get_db(db_path)
@@ -110,6 +136,9 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
         conn.execute("DELETE FROM symbols")
         conn.execute("DELETE FROM keyword_files")
         conn.execute("DELETE FROM files")
+        conn.execute("DELETE FROM project_summary")
+        conn.execute("DELETE FROM file_imports")
+        conn.execute("DELETE FROM symbol_categories")
 
         # Metadata
         slug = _make_slug(project_root)
@@ -152,6 +181,29 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
                     "INSERT OR REPLACE INTO keyword_files VALUES (?, ?)",
                     (keyword, rel_path)
                 )
+
+        # v6: Project summary
+        if project_summary:
+            for key, value in project_summary.items():
+                val = json.dumps(value) if not isinstance(value, str) else value
+                conn.execute(
+                    "INSERT OR REPLACE INTO project_summary VALUES (?, ?)",
+                    (key, val)
+                )
+
+        # v6: File imports
+        if imports_data:
+            conn.executemany(
+                "INSERT OR REPLACE INTO file_imports VALUES (?, ?, ?)",
+                imports_data
+            )
+
+        # v6: Symbol categories
+        if categories_data:
+            conn.executemany(
+                "INSERT OR REPLACE INTO symbol_categories VALUES (?, ?, ?, ?)",
+                categories_data
+            )
 
         conn.commit()
     except Exception:
@@ -404,6 +456,75 @@ def load_embeddings(project_root: str = "", identifier: str = "") -> list[tuple[
         rows = conn.execute("SELECT rel_path, chunk_index, vector FROM embeddings").fetchall()
         conn.close()
         return [(r["rel_path"], r["chunk_index"], r["vector"]) for r in rows]
+    except Exception:
+        return []
+
+
+def get_project_db_path(project_path: str) -> Path | None:
+    """Return the DB path for a project (for direct SQL access)."""
+    return resolve_project_db(project_path)
+
+
+def load_project_summary(project_path: str) -> dict:
+    """Load project_summary table as a dict. Returns {} if not available."""
+    db_path = resolve_project_db(project_path)
+    if not db_path or not db_path.exists():
+        return {}
+    try:
+        conn = _get_db(db_path)
+        rows = conn.execute("SELECT key, value FROM project_summary").fetchall()
+        conn.close()
+        result = {}
+        for r in rows:
+            try:
+                result[r["key"]] = json.loads(r["value"])
+            except (json.JSONDecodeError, TypeError):
+                result[r["key"]] = r["value"]
+        return result
+    except Exception:
+        return {}
+
+
+def load_symbol_categories(project_path: str, category: str | None = None) -> list[dict]:
+    """Load symbol categories, optionally filtered by category."""
+    db_path = resolve_project_db(project_path)
+    if not db_path or not db_path.exists():
+        return []
+    try:
+        conn = _get_db(db_path)
+        if category:
+            rows = conn.execute(
+                "SELECT rel_path, symbol_name, category, detail FROM symbol_categories WHERE category=?",
+                (category,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT rel_path, symbol_name, category, detail FROM symbol_categories"
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def load_file_imports(project_path: str, symbol_name: str | None = None) -> list[dict]:
+    """Load file imports, optionally filtered by imported name."""
+    db_path = resolve_project_db(project_path)
+    if not db_path or not db_path.exists():
+        return []
+    try:
+        conn = _get_db(db_path)
+        if symbol_name:
+            rows = conn.execute(
+                "SELECT source_path, imported_name, target_path FROM file_imports WHERE imported_name LIKE ?",
+                (f"%{symbol_name}%",)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT source_path, imported_name, target_path FROM file_imports"
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
     except Exception:
         return []
 
