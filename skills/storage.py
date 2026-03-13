@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 INDEX_DIR = Path.home() / ".codebase-qa-agent"
 DB_FILE = INDEX_DIR / "index.db"  # legacy single-project path
 # Keep the old JSON path for migration
@@ -117,6 +117,22 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_symbol_categories_cat ON symbol_categories(category);
         CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(target_path);
+
+        -- v7: LLM-generated semantic intelligence
+        CREATE TABLE IF NOT EXISTS module_summaries (
+            module_path TEXT PRIMARY KEY,
+            summary TEXT NOT NULL,
+            key_patterns TEXT,
+            domain_concepts TEXT,
+            key_abstractions TEXT,
+            generated_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS semantic_summary (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            generated_at REAL NOT NULL
+        );
     """)
 
 
@@ -124,7 +140,9 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
                project_root: str, indexed_at: float,
                project_summary: dict | None = None,
                imports_data: list[tuple] | None = None,
-               categories_data: list[tuple] | None = None) -> None:
+               categories_data: list[tuple] | None = None,
+               module_summaries_data: list[dict] | None = None,
+               semantic_summary_data: dict | None = None) -> None:
     """Save the full index to a per-project SQLite database."""
     db_path = _project_db_path(project_root)
     conn = _get_db(db_path)
@@ -139,6 +157,8 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
         conn.execute("DELETE FROM project_summary")
         conn.execute("DELETE FROM file_imports")
         conn.execute("DELETE FROM symbol_categories")
+        conn.execute("DELETE FROM module_summaries")
+        conn.execute("DELETE FROM semantic_summary")
 
         # Metadata
         slug = _make_slug(project_root)
@@ -204,6 +224,30 @@ def save_index(file_index: dict, keyword_map: dict, symbol_map: dict,
                 "INSERT OR REPLACE INTO symbol_categories VALUES (?, ?, ?, ?)",
                 categories_data
             )
+
+        # v7: Module summaries (LLM-generated)
+        if module_summaries_data:
+            import time as _time
+            now = _time.time()
+            for mod in module_summaries_data:
+                conn.execute(
+                    "INSERT OR REPLACE INTO module_summaries VALUES (?, ?, ?, ?, ?, ?)",
+                    (mod["module_path"], mod["summary"],
+                     json.dumps(mod.get("key_patterns", [])),
+                     json.dumps(mod.get("domain_concepts", [])),
+                     json.dumps(mod.get("key_abstractions", [])),
+                     mod.get("generated_at", now))
+                )
+
+        # v7: Semantic summary (LLM-generated project understanding)
+        if semantic_summary_data:
+            import time as _time
+            now = _time.time()
+            for key, value in semantic_summary_data.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO semantic_summary VALUES (?, ?, ?)",
+                    (key, value if isinstance(value, str) else json.dumps(value), now)
+                )
 
         conn.commit()
     except Exception:
@@ -507,14 +551,20 @@ def load_symbol_categories(project_path: str, category: str | None = None) -> li
         return []
 
 
-def load_file_imports(project_path: str, symbol_name: str | None = None) -> list[dict]:
-    """Load file imports, optionally filtered by imported name."""
+def load_file_imports(project_path: str, symbol_name: str | None = None,
+                      source_path: str | None = None) -> list[dict]:
+    """Load file imports, optionally filtered by imported name or source file."""
     db_path = resolve_project_db(project_path)
     if not db_path or not db_path.exists():
         return []
     try:
         conn = _get_db(db_path)
-        if symbol_name:
+        if source_path:
+            rows = conn.execute(
+                "SELECT source_path, imported_name, target_path FROM file_imports WHERE source_path = ?",
+                (source_path,)
+            ).fetchall()
+        elif symbol_name:
             rows = conn.execute(
                 "SELECT source_path, imported_name, target_path FROM file_imports WHERE imported_name LIKE ?",
                 (f"%{symbol_name}%",)
@@ -527,6 +577,47 @@ def load_file_imports(project_path: str, symbol_name: str | None = None) -> list
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def load_module_summaries(project_path: str) -> list[dict]:
+    """Load LLM-generated module summaries. Returns list of dicts."""
+    db_path = resolve_project_db(project_path)
+    if not db_path or not db_path.exists():
+        return []
+    try:
+        conn = _get_db(db_path)
+        rows = conn.execute(
+            "SELECT module_path, summary, key_patterns, domain_concepts, key_abstractions, generated_at "
+            "FROM module_summaries"
+        ).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            result.append({
+                "module_path": r["module_path"],
+                "summary": r["summary"],
+                "key_patterns": json.loads(r["key_patterns"]) if r["key_patterns"] else [],
+                "domain_concepts": json.loads(r["domain_concepts"]) if r["domain_concepts"] else [],
+                "key_abstractions": json.loads(r["key_abstractions"]) if r["key_abstractions"] else [],
+                "generated_at": r["generated_at"],
+            })
+        return result
+    except Exception:
+        return []
+
+
+def load_semantic_summary(project_path: str) -> dict:
+    """Load LLM-generated semantic summary. Returns dict like {purpose: ..., architecture: ..., ...}."""
+    db_path = resolve_project_db(project_path)
+    if not db_path or not db_path.exists():
+        return {}
+    try:
+        conn = _get_db(db_path)
+        rows = conn.execute("SELECT key, value FROM semantic_summary").fetchall()
+        conn.close()
+        return {r["key"]: r["value"] for r in rows}
+    except Exception:
+        return {}
 
 
 def _get_sessions_db() -> sqlite3.Connection:
