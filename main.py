@@ -11,6 +11,13 @@ from reasoners.qa import qa_router
 from reasoners.summary import summary_router
 from reasoners.retrieval import retrieval_router
 
+# Model tiering — swap individual tasks to cheaper/faster models as needed
+MODELS = {
+    "classify": "groq/llama-3.3-70b-versatile",   # query planning
+    "summarize": "groq/llama-3.3-70b-versatile",  # code summarization at index time
+    "answer": "groq/llama-3.3-70b-versatile",     # answer synthesis
+}
+
 app = Agent(
     node_id="codebase-qa-agent",
     agentfield_server=os.getenv("AGENTFIELD_CONTROL_PLANE_URL", "http://localhost:8080"),

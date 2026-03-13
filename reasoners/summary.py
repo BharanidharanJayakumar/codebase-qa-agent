@@ -10,6 +10,8 @@ from skills.storage import (
     load_project_summary,
     load_symbol_categories,
     load_file_imports,
+    load_module_summaries,
+    load_semantic_summary,
     get_project_db_path,
 )
 
@@ -37,7 +39,16 @@ async def get_project_overview(project_path: str) -> dict:
         except (json.JSONDecodeError, TypeError):
             result[key] = value
 
-    return {"status": "ok", "summary": result}
+    # Include semantic intelligence (v7)
+    semantic = load_semantic_summary(project_path)
+    modules = load_module_summaries(project_path)
+
+    return {
+        "status": "ok",
+        "summary": result,
+        "semantic": semantic if semantic else None,
+        "modules": modules if modules else None,
+    }
 
 
 @summary_router.reasoner()

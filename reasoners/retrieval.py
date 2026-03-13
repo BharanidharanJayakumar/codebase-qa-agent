@@ -21,7 +21,7 @@ except ImportError:
 
 retrieval_router = AgentRouter(prefix="retrieval", tags=["retrieval"])
 
-MIN_SCORE = 0.5
+MIN_SCORE = 0.2
 MAX_CONTEXT_CHARS = 24_000
 
 
