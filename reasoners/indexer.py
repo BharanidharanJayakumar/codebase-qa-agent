@@ -7,6 +7,7 @@ from skills.scanner import scan_directory, read_file
 from skills.extractor import extract_symbols, extract_keywords, chunk_file
 from skills.storage import save_index, load_index, delete_project as storage_delete_project
 from skills.aggregator import build_project_summary, extract_imports, categorize_symbols
+from skills.summarizer import generate_hierarchical_summary
 
 # Embeddings are optional — built at index time if available
 try:
@@ -110,12 +111,32 @@ async def index_project(project_path: str) -> dict:
     # Build project-level summary (languages, frameworks, dir tree, etc.)
     project_summary = build_project_summary(project_path, file_index, symbol_map)
 
+    # Generate LLM-powered semantic summaries (hierarchical: modules → project)
+    module_summaries_data = []
+    semantic_summary_data = {}
+    try:
+        module_summaries_data, semantic_summary_data = await generate_hierarchical_summary(
+            file_index, symbol_map, project_path, all_imports, indexer_router
+        )
+        if module_summaries_data:
+            indexer_router.app.note(
+                f"Generated {len(module_summaries_data)} module summaries + project synthesis",
+                tags=["indexing", "summarizer"]
+            )
+    except Exception as e:
+        indexer_router.app.note(
+            f"Semantic summarization skipped: {e}",
+            tags=["indexing", "summarizer", "warning"]
+        )
+
     indexed_at = time.time()
     save_index(
         file_index, keyword_map, symbol_map, project_path, indexed_at,
         project_summary=project_summary,
         imports_data=all_imports,
         categories_data=all_categories,
+        module_summaries_data=module_summaries_data,
+        semantic_summary_data=semantic_summary_data,
     )
 
     # Build and persist embeddings (optional, runs if sentence-transformers is installed)
@@ -223,12 +244,24 @@ async def update_index(project_path: str) -> dict:
 
     project_summary = build_project_summary(project_root, file_index, symbol_map)
 
+    # Regenerate semantic summaries on update
+    module_summaries_data = []
+    semantic_summary_data = {}
+    try:
+        module_summaries_data, semantic_summary_data = await generate_hierarchical_summary(
+            file_index, symbol_map, project_root, all_imports, indexer_router
+        )
+    except Exception:
+        pass  # graceful degradation
+
     new_timestamp = time.time()
     save_index(
         file_index, keyword_map, symbol_map, project_root, new_timestamp,
         project_summary=project_summary,
         imports_data=all_imports,
         categories_data=all_categories,
+        module_summaries_data=module_summaries_data,
+        semantic_summary_data=semantic_summary_data,
     )
 
     return {
