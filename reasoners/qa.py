@@ -14,7 +14,7 @@ from skills.storage import (
     load_module_summaries, load_semantic_summary,
 )
 from pathlib import Path as _Path
-from reasoners.retrieval import retrieve_context
+from reasoners.retrieval import retrieve_context, retrieve_context_with_rerank
 
 qa_router = AgentRouter(prefix="qa", tags=["question-answering"])
 
@@ -48,7 +48,8 @@ Available data sources:
 Rules:
 - For overview/theme/purpose questions: always include semantic_summary + module_summaries
 - For code-specific questions: always include code_chunks
-- For counting/listing questions: always include categories
+- For counting/listing questions (how many, list all, what are the, what about): always include categories
+- For follow-up questions like "what about the other X?" or "any more?": use the same sources as the original question (usually categories)
 - You can select multiple sources for richer answers
 - Include search_terms only when code_chunks is selected"""
 
@@ -241,12 +242,26 @@ def _format_aggregate(question: str, project_path: str) -> tuple[str, dict]:
 
     parts = ["=== CATEGORIZED SYMBOLS ==="]
     for cat, items in grouped.items():
-        parts.append(f"\n{cat.upper()} ({len(items)} found):")
-        for item in items[:30]:
-            parts.append(f"  {item['symbol']} in {item['file']} ({item['detail']})")
+        # Group by file for cleaner output — shows all files with their symbols
+        by_file: dict[str, list[str]] = {}
+        for item in items:
+            by_file.setdefault(item["file"], []).append(item["symbol"])
+
+        unique_files = len(by_file)
+        parts.append(f"\n{cat.upper()} ({len(items)} symbols across {unique_files} files):")
+        for filepath, symbols in sorted(by_file.items()):
+            # Deduplicate and filter out generic symbols (Ok, BadRequest, NotFound, etc.)
+            generic = {"Ok", "BadRequest", "NotFound", "NoContent", "Unauthorized",
+                       "CreatedAtAction", "ArgumentNullException"}
+            meaningful = [s for s in symbols if s not in generic]
+            sym_str = ", ".join(meaningful[:10])
+            if len(meaningful) > 10:
+                sym_str += f" (+{len(meaningful) - 10} more)"
+            parts.append(f"  {filepath}: [{sym_str}]")
 
     total = sum(len(v) for v in grouped.values())
-    extra = {"aggregate_total": total, "aggregate_filter": target_category}
+    unique_total = sum(len(set(item["file"] for item in items)) for items in grouped.values())
+    extra = {"aggregate_total": total, "aggregate_filter": target_category, "unique_files": unique_total}
     return "\n".join(parts), extra
 
 
@@ -320,16 +335,23 @@ async def _execute_query_plan(
 
     if "code_chunks" in plan.data_sources:
         search_query = " ".join(plan.search_terms) if plan.search_terms else question
-        code_ctx = retrieve_context(search_query, file_index, keyword_map, symbol_map, project_root)
+        # Use LLM-reranked retrieval for higher quality code context
+        code_ctx = await retrieve_context_with_rerank(
+            search_query, file_index, keyword_map, symbol_map, project_root,
+            router=qa_router,
+        )
         if code_ctx["context"]:
             context_parts.append("=== SOURCE CODE ===\n" + code_ctx["context"])
         top_files = code_ctx["top_files"]
         if not confidence or confidence == "medium":
             confidence = code_ctx["confidence"]
 
-    # Fallback: if no context gathered, try code retrieval
+    # Fallback: if no context gathered, try code retrieval with reranking
     if not any(p.strip() for p in context_parts):
-        code_ctx = retrieve_context(question, file_index, keyword_map, symbol_map, project_root)
+        code_ctx = await retrieve_context_with_rerank(
+            question, file_index, keyword_map, symbol_map, project_root,
+            router=qa_router,
+        )
         if code_ctx["context"]:
             context_parts.append("=== SOURCE CODE ===\n" + code_ctx["context"])
         top_files = code_ctx["top_files"]
@@ -348,8 +370,9 @@ async def _execute_query_plan(
 INTENT_PROMPTS = {
     "aggregate": (
         "The user is asking an aggregate/counting question. "
-        "Use the categorized symbol data to give precise counts and lists. "
-        "Be specific about file locations."
+        "Use the categorized symbol data to give precise counts and COMPLETE lists. "
+        "List ALL items found — do not omit any. Be specific about file locations. "
+        "If the data shows 10 controllers, list all 10. Never say 'there are no others'."
     ),
     "overview": (
         "The user is asking about the project overview, theme, or purpose. "

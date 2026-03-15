@@ -1,7 +1,7 @@
 """
 Retrieval agent — file relevance scoring, code search, and context building.
 Moved from qa.py to its own agent for separation of concerns.
-No LLM calls; pure keyword/BM25/embedding retrieval.
+Uses BM25/keyword retrieval + optional LLM reranking for quality.
 """
 import math
 import re
@@ -96,6 +96,143 @@ def retrieve_context(query: str, file_index: dict, keyword_map: dict, symbol_map
             chars_used += len(part)
         if chars_used >= MAX_CONTEXT_CHARS:
             break
+
+    # Add symbol location hints
+    for sym_name, locations in symbol_hits.items():
+        for loc in locations:
+            context_parts.append(
+                f"\n[Symbol `{sym_name}` defined in {loc['file']} "
+                f"at line {loc['line']} ({loc['type']})]"
+            )
+
+    # Confidence calculation
+    top_score = ranked[0][1] if ranked else 0
+    max_possible = len(query_keywords) * math.log(total_files + 1) + 5 if total_files else 1
+    ratio = top_score / max_possible if max_possible > 0 else 0
+
+    has_symbol_hits = len(symbol_hits) > 0
+    matching_file_count = len(ranked)
+
+    if has_symbol_hits and matching_file_count >= 1:
+        confidence = "high"
+    elif ratio >= 0.15 or (matching_file_count >= 3 and ratio >= 0.08):
+        confidence = "high"
+    elif ratio >= 0.05 or matching_file_count >= 2:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "context": "\n\n".join(context_parts),
+        "top_files": top_files,
+        "symbol_hits": symbol_hits,
+        "confidence": confidence,
+        "top_score": top_score,
+    }
+
+
+async def retrieve_context_with_rerank(
+    query: str, file_index: dict, keyword_map: dict, symbol_map: dict,
+    project_root: str = "", router=None,
+) -> dict:
+    """
+    Enhanced retrieval: BM25 + symbol matching + LLM reranking.
+
+    First pass: BM25/keyword scoring picks top 10 candidate files.
+    Second pass: LLM reranks the code chunks by actual relevance to the question.
+    Falls back to standard retrieve_context if LLM reranking fails.
+    """
+    # Phase 1: Standard BM25 retrieval (get more candidates than usual)
+    query_keywords = extract_keywords(query, top_n=10)
+    query_words = query.lower().split()
+    total_files = len(file_index)
+
+    # Direct symbol name matches
+    symbol_lower = {k.lower(): v for k, v in symbol_map.items()}
+    symbol_hits = {}
+    for word in query_words:
+        if word in symbol_lower:
+            symbol_hits[word] = symbol_lower[word]
+    for raw_word in query.split():
+        if raw_word in symbol_map and raw_word.lower() not in symbol_hits:
+            symbol_hits[raw_word.lower()] = symbol_map[raw_word]
+
+    # BM25 IDF scoring
+    file_scores: dict[str, float] = {}
+    for kw in query_keywords:
+        files_with_kw = keyword_map.get(kw, [])
+        if not files_with_kw:
+            continue
+        df = len(files_with_kw)
+        idf = math.log((total_files - df + 0.5) / (df + 0.5) + 1)
+        for file_path in files_with_kw:
+            file_scores[file_path] = file_scores.get(file_path, 0) + idf
+
+    # Boost files with direct symbol hits
+    for sym_name, locations in symbol_hits.items():
+        for loc in locations:
+            file_path = loc["file"]
+            file_scores[file_path] = file_scores.get(file_path, 0) + 5
+
+    # Semantic search boost
+    if EMBEDDINGS_AVAILABLE and total_files > 0:
+        try:
+            sem_results = load_and_search(query, project_root=project_root, top_k=10)
+            for rel_path, chunk_idx, score in sem_results:
+                if score > 0.3:
+                    file_scores[rel_path] = file_scores.get(rel_path, 0) + score * 3
+        except Exception:
+            pass
+
+    ranked = [(p, s) for p, s in file_scores.items() if s >= MIN_SCORE]
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    # Get more candidates for reranking (top 10 instead of 5)
+    candidate_files = [path for path, _ in ranked[:10]]
+
+    # Phase 2: Collect all chunks from candidate files
+    all_chunks = []
+    for file_path in candidate_files:
+        meta = file_index.get(file_path, {})
+        chunks = meta.get("chunks", [])
+        for chunk in chunks:
+            all_chunks.append({
+                "file": file_path,
+                "symbol": chunk.get("symbol", ""),
+                "content": chunk.get("content", ""),
+                "start_line": chunk.get("start_line", 0),
+                "end_line": chunk.get("end_line", 0),
+            })
+
+    # Phase 3: LLM Reranking
+    reranked_order = list(range(len(all_chunks)))  # default: original order
+    if router and all_chunks:
+        try:
+            from skills.llm_intelligence import rerank_chunks_llm
+            reranked_order = await rerank_chunks_llm(query, all_chunks, router)
+        except Exception:
+            pass  # Fall back to BM25 order
+
+    # Phase 4: Build context from reranked chunks with token budget
+    context_parts = []
+    chars_used = 0
+    seen_files = set()
+
+    for idx in reranked_order:
+        if idx >= len(all_chunks):
+            continue
+        chunk = all_chunks[idx]
+        sym_label = f" ({chunk['symbol']})" if chunk.get("symbol") else ""
+        part = (
+            f"=== {chunk['file']} [lines {chunk['start_line']}-{chunk['end_line']}]{sym_label} ===\n"
+            f"{chunk['content']}"
+        )
+        if chars_used + len(part) > MAX_CONTEXT_CHARS:
+            break
+        context_parts.append(part)
+        chars_used += len(part)
+        seen_files.add(chunk["file"])
+
+    top_files = list(seen_files)[:5]
 
     # Add symbol location hints
     for sym_name, locations in symbol_hits.items():
