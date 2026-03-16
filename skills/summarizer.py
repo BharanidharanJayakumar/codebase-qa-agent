@@ -33,7 +33,7 @@ MAX_FILE_CHARS = 2000
 # Max representative files per module
 MAX_FILES_PER_MODULE = 3
 # Delay between LLM calls (rate limiting for Groq free tier)
-CALL_DELAY_SECONDS = 3
+CALL_DELAY_SECONDS = 1
 # Max retries on rate limit
 MAX_RETRIES = 3
 

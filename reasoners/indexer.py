@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import time
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -8,6 +10,7 @@ from skills.extractor import extract_symbols, extract_keywords, chunk_file
 from skills.storage import save_index, load_index, delete_project as storage_delete_project
 from skills.aggregator import build_project_summary, extract_imports, categorize_symbols
 from skills.summarizer import generate_hierarchical_summary
+from skills.llm_intelligence import categorize_symbols_llm, extract_concepts_llm
 
 # Embeddings are optional — built at index time if available
 try:
@@ -24,6 +27,11 @@ class IndexResult(BaseModel):
     project_root: str
     indexed_at: float
     message: str
+    status: str = "ready"  # "ready" = basic index done, "enriching" = LLM running in background
+
+
+# Track enrichment status per project
+_enrichment_status: dict[str, str] = {}  # project_path -> "enriching" | "complete" | "failed"
 
 
 @indexer_router.reasoner()
@@ -96,10 +104,11 @@ async def index_project(project_path: str) -> dict:
             "last_modified": file_meta["last_modified"],
         }
 
-        # Extract imports and categorize symbols for project-level intelligence
+        # Extract imports for project-level intelligence
         file_imports = extract_imports(content, rel_path, project_files)
         all_imports.extend(file_imports)
 
+        # Regex categorization as fallback (will be replaced by LLM below)
         file_categories = categorize_symbols(rel_path, content, symbols)
         all_categories.extend(file_categories)
 
@@ -108,55 +117,162 @@ async def index_project(project_path: str) -> dict:
             tags=["indexing", "progress"]
         )
 
-    # Build project-level summary (languages, frameworks, dir tree, etc.)
+    # ── Phase 1: Save basic index immediately (fast — user gets instant response) ──
     project_summary = build_project_summary(project_path, file_index, symbol_map)
-
-    # Generate LLM-powered semantic summaries (hierarchical: modules → project)
-    module_summaries_data = []
-    semantic_summary_data = {}
-    try:
-        module_summaries_data, semantic_summary_data = await generate_hierarchical_summary(
-            file_index, symbol_map, project_path, all_imports, indexer_router
-        )
-        if module_summaries_data:
-            indexer_router.app.note(
-                f"Generated {len(module_summaries_data)} module summaries + project synthesis",
-                tags=["indexing", "summarizer"]
-            )
-    except Exception as e:
-        indexer_router.app.note(
-            f"Semantic summarization skipped: {e}",
-            tags=["indexing", "summarizer", "warning"]
-        )
-
     indexed_at = time.time()
     save_index(
         file_index, keyword_map, symbol_map, project_path, indexed_at,
         project_summary=project_summary,
         imports_data=all_imports,
         categories_data=all_categories,
-        module_summaries_data=module_summaries_data,
-        semantic_summary_data=semantic_summary_data,
     )
 
-    # Build and persist embeddings (optional, runs if sentence-transformers is installed)
+    indexer_router.app.note(
+        f"Phase 1 complete: {len(file_index)} files indexed. Starting LLM enrichment in background...",
+        tags=["indexing", "phase1"]
+    )
+
+    # ── Phase 2: LLM enrichment runs in background (doesn't block response) ──
+    _enrichment_status[project_path] = "enriching"
+
+    bg_file_index = copy.deepcopy(file_index)
+    bg_keyword_map = copy.deepcopy(keyword_map)
+    bg_symbol_map = copy.deepcopy(symbol_map)
+    bg_imports = list(all_imports)
+    bg_categories = list(all_categories)
+
+    async def _enrich_index_background():
+        """Background task: LLM categorization, concept extraction, hierarchical summaries."""
+        try:
+            enriched_categories = bg_categories
+            enriched_keywords = bg_keyword_map
+
+            # 1. LLM Symbol Categorization
+            try:
+                llm_cats = await categorize_symbols_llm(
+                    bg_file_index, bg_symbol_map, project_path, indexer_router
+                )
+                if llm_cats:
+                    enriched_categories = llm_cats
+                    indexer_router.app.note(
+                        f"LLM categorized {len(llm_cats)} symbols",
+                        tags=["indexing", "llm-categorization"]
+                    )
+            except Exception as e:
+                indexer_router.app.note(
+                    f"LLM categorization skipped: {e}",
+                    tags=["indexing", "llm-categorization", "warning"]
+                )
+
+            # 2. LLM Concept Extraction
+            try:
+                llm_concepts = await extract_concepts_llm(
+                    bg_file_index, project_path, indexer_router
+                )
+                if llm_concepts:
+                    for rp, concepts in llm_concepts.items():
+                        for concept in concepts:
+                            words = concept.lower().split()
+                            for word in words:
+                                word = word.strip(".,;:!?()[]{}\"'")
+                                if len(word) > 2:
+                                    enriched_keywords.setdefault(word, [])
+                                    if rp not in enriched_keywords[word]:
+                                        enriched_keywords[word].append(rp)
+                            full = concept.lower().strip()
+                            if full and len(full) > 2:
+                                enriched_keywords.setdefault(full, [])
+                                if rp not in enriched_keywords[full]:
+                                    enriched_keywords[full].append(rp)
+                    indexer_router.app.note(
+                        f"LLM extracted concepts for {len(llm_concepts)} files",
+                        tags=["indexing", "llm-concepts"]
+                    )
+            except Exception as e:
+                indexer_router.app.note(
+                    f"LLM concept extraction skipped: {e}",
+                    tags=["indexing", "llm-concepts", "warning"]
+                )
+
+            # 3. Hierarchical Summaries
+            module_sums = []
+            semantic_sum = {}
+            try:
+                module_sums, semantic_sum = await generate_hierarchical_summary(
+                    bg_file_index, bg_symbol_map, project_path, bg_imports, indexer_router
+                )
+                if module_sums:
+                    indexer_router.app.note(
+                        f"Generated {len(module_sums)} module summaries + project synthesis",
+                        tags=["indexing", "summarizer"]
+                    )
+            except Exception as e:
+                indexer_router.app.note(
+                    f"Summarization skipped: {e}",
+                    tags=["indexing", "summarizer", "warning"]
+                )
+
+            # 4. Save enriched index (overwrites Phase 1 data with LLM-enhanced version)
+            save_index(
+                bg_file_index, enriched_keywords, bg_symbol_map, project_path,
+                time.time(),
+                project_summary=project_summary,
+                imports_data=bg_imports,
+                categories_data=enriched_categories,
+                module_summaries_data=module_sums,
+                semantic_summary_data=semantic_sum,
+            )
+
+            _enrichment_status[project_path] = "complete"
+            indexer_router.app.note(
+                "Phase 2 complete: LLM enrichment saved. Index fully upgraded.",
+                tags=["indexing", "phase2", "complete"]
+            )
+
+        except Exception as e:
+            _enrichment_status[project_path] = "failed"
+            indexer_router.app.note(
+                f"Background enrichment failed: {e}",
+                tags=["indexing", "phase2", "error"]
+            )
+
+    # Fire and forget — the background task enriches the index while user can already query
+    asyncio.create_task(_enrich_index_background())
+
+    # Build and persist embeddings (optional)
     embeddings_count = 0
     if EMBEDDINGS_AVAILABLE:
         try:
             embeddings_count = build_and_save_embeddings(file_index, project_path)
-            indexer_router.app.note(
-                f"Built {embeddings_count} embeddings for semantic search",
-                tags=["indexing", "embeddings"]
-            )
         except Exception:
-            pass  # Graceful degradation
+            pass
 
     return IndexResult(
         files_indexed=len(file_index),
         project_root=project_path,
         indexed_at=indexed_at,
-        message=f"Indexed {len(file_index)} files ({embeddings_count} embeddings). Ready to answer questions.",
+        message=f"Indexed {len(file_index)} files. LLM enrichment running in background.",
+        status="enriching",
     ).model_dump()
+
+
+@indexer_router.reasoner()
+async def get_enrichment_status(project_path: str = "") -> dict:
+    """Check the LLM enrichment status for a project."""
+    if not project_path:
+        # Return all statuses
+        return {"statuses": dict(_enrichment_status)}
+
+    status = _enrichment_status.get(project_path, "unknown")
+
+    # Also check if semantic_summary exists in DB (enrichment may have completed in a prior run)
+    if status == "unknown":
+        from skills.storage import load_semantic_summary
+        sem = load_semantic_summary(project_path)
+        if sem:
+            status = "complete"
+
+    return {"project_path": project_path, "enrichment_status": status}
 
 
 @indexer_router.reasoner()
@@ -242,34 +358,84 @@ async def update_index(project_path: str) -> dict:
         file_categories = categorize_symbols(rel_path, content, symbols)
         all_categories.extend(file_categories)
 
+    # Save basic index immediately
     project_summary = build_project_summary(project_root, file_index, symbol_map)
-
-    # Regenerate semantic summaries on update
-    module_summaries_data = []
-    semantic_summary_data = {}
-    try:
-        module_summaries_data, semantic_summary_data = await generate_hierarchical_summary(
-            file_index, symbol_map, project_root, all_imports, indexer_router
-        )
-    except Exception:
-        pass  # graceful degradation
-
     new_timestamp = time.time()
     save_index(
         file_index, keyword_map, symbol_map, project_root, new_timestamp,
         project_summary=project_summary,
         imports_data=all_imports,
         categories_data=all_categories,
-        module_summaries_data=module_summaries_data,
-        semantic_summary_data=semantic_summary_data,
     )
+
+    # LLM enrichment in background (same pattern as index_project)
+    bg_fi = copy.deepcopy(file_index)
+    bg_kw = copy.deepcopy(keyword_map)
+    bg_sm = copy.deepcopy(symbol_map)
+    bg_imp = list(all_imports)
+    bg_cats = list(all_categories)
+
+    async def _enrich_update_background():
+        try:
+            enriched_cats = bg_cats
+            enriched_kw = bg_kw
+
+            try:
+                llm_cats = await categorize_symbols_llm(bg_fi, bg_sm, project_root, indexer_router)
+                if llm_cats:
+                    enriched_cats = llm_cats
+            except Exception:
+                pass
+
+            try:
+                llm_concepts = await extract_concepts_llm(bg_fi, project_root, indexer_router)
+                if llm_concepts:
+                    for rp, concepts in llm_concepts.items():
+                        for concept in concepts:
+                            for word in concept.lower().split():
+                                word = word.strip(".,;:!?()[]{}\"'")
+                                if len(word) > 2:
+                                    enriched_kw.setdefault(word, [])
+                                    if rp not in enriched_kw[word]:
+                                        enriched_kw[word].append(rp)
+                            full = concept.lower().strip()
+                            if full and len(full) > 2:
+                                enriched_kw.setdefault(full, [])
+                                if rp not in enriched_kw[full]:
+                                    enriched_kw[full].append(rp)
+            except Exception:
+                pass
+
+            mod_sums, sem_sum = [], {}
+            try:
+                mod_sums, sem_sum = await generate_hierarchical_summary(
+                    bg_fi, bg_sm, project_root, bg_imp, indexer_router
+                )
+            except Exception:
+                pass
+
+            save_index(
+                bg_fi, enriched_kw, bg_sm, project_root, time.time(),
+                project_summary=project_summary,
+                imports_data=bg_imp,
+                categories_data=enriched_cats,
+                module_summaries_data=mod_sums,
+                semantic_summary_data=sem_sum,
+            )
+            indexer_router.app.note(
+                "Update enrichment complete.", tags=["update", "phase2", "complete"]
+            )
+        except Exception:
+            pass
+
+    asyncio.create_task(_enrich_update_background())
 
     return {
         "files_updated": len(changed),
         "files_deleted": len(deleted),
         "updated_files": [f["relative_path"] for f in changed],
         "deleted_files": list(deleted),
-        "message": f"Re-indexed {len(changed)} changed, removed {len(deleted)} deleted file(s).",
+        "message": f"Re-indexed {len(changed)} changed, removed {len(deleted)} deleted. LLM enrichment running in background.",
     }
 
 
@@ -353,15 +519,44 @@ async def clone_and_index(github_url: str) -> dict:
 
 
 @indexer_router.reasoner()
-async def delete_project(project_identifier: str) -> dict:
+async def delete_project(project_identifier: str, delete_repo: bool = False) -> dict:
     """
     Delete an indexed project by path, slug, or project_id.
+    Set delete_repo=true to also remove the cloned repository from disk.
 
     curl -X POST http://localhost:8080/api/v1/execute/codebase-qa-agent.indexer_delete_project \\
       -H "Content-Type: application/json" \\
-      -d '{"input": {"project_identifier": "codebase-qa-agent"}}'
+      -d '{"input": {"project_identifier": "codebase-qa-agent", "delete_repo": true}}'
     """
+    # Find the project root before deleting the DB
+    import shutil
+    from skills.storage import resolve_project_db
+    import sqlite3
+
+    repo_path = None
+    db_path = resolve_project_db(project_identifier)
+    if db_path and db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path))
+            row = conn.execute("SELECT value FROM meta WHERE key='project_root'").fetchone()
+            if row:
+                repo_path = row[0]
+            conn.close()
+        except Exception:
+            pass
+
     deleted = storage_delete_project(project_identifier)
+
+    repo_deleted = False
+    if deleted and delete_repo and repo_path:
+        repo = Path(repo_path)
+        if repo.exists() and repo.is_dir():
+            try:
+                shutil.rmtree(str(repo))
+                repo_deleted = True
+            except Exception:
+                pass
+
     if deleted:
         # Also stop any active watcher
         try:
@@ -372,8 +567,13 @@ async def delete_project(project_identifier: str) -> dict:
 
     return {
         "deleted": deleted,
+        "repo_deleted": repo_deleted,
         "project_identifier": project_identifier,
-        "message": "Project deleted successfully." if deleted else "Project not found.",
+        "message": (
+            "Project and repo deleted successfully." if repo_deleted
+            else "Project deleted successfully." if deleted
+            else "Project not found."
+        ),
     }
 
 
