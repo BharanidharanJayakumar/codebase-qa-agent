@@ -10,7 +10,6 @@ from skills.extractor import extract_symbols, extract_keywords, chunk_file
 from skills.storage import save_index, load_index, delete_project as storage_delete_project
 from skills.aggregator import build_project_summary, extract_imports, categorize_symbols
 from skills.summarizer import generate_hierarchical_summary
-from skills.llm_intelligence import categorize_symbols_llm, extract_concepts_llm
 
 # Embeddings are optional — built at index time if available
 try:
@@ -142,59 +141,9 @@ async def index_project(project_path: str) -> dict:
     bg_categories = list(all_categories)
 
     async def _enrich_index_background():
-        """Background task: LLM categorization, concept extraction, hierarchical summaries."""
+        """Background task: generate hierarchical folder summaries + project synthesis."""
         try:
-            enriched_categories = bg_categories
-            enriched_keywords = bg_keyword_map
-
-            # 1. LLM Symbol Categorization
-            try:
-                llm_cats = await categorize_symbols_llm(
-                    bg_file_index, bg_symbol_map, project_path, indexer_router
-                )
-                if llm_cats:
-                    enriched_categories = llm_cats
-                    indexer_router.app.note(
-                        f"LLM categorized {len(llm_cats)} symbols",
-                        tags=["indexing", "llm-categorization"]
-                    )
-            except Exception as e:
-                indexer_router.app.note(
-                    f"LLM categorization skipped: {e}",
-                    tags=["indexing", "llm-categorization", "warning"]
-                )
-
-            # 2. LLM Concept Extraction
-            try:
-                llm_concepts = await extract_concepts_llm(
-                    bg_file_index, project_path, indexer_router
-                )
-                if llm_concepts:
-                    for rp, concepts in llm_concepts.items():
-                        for concept in concepts:
-                            words = concept.lower().split()
-                            for word in words:
-                                word = word.strip(".,;:!?()[]{}\"'")
-                                if len(word) > 2:
-                                    enriched_keywords.setdefault(word, [])
-                                    if rp not in enriched_keywords[word]:
-                                        enriched_keywords[word].append(rp)
-                            full = concept.lower().strip()
-                            if full and len(full) > 2:
-                                enriched_keywords.setdefault(full, [])
-                                if rp not in enriched_keywords[full]:
-                                    enriched_keywords[full].append(rp)
-                    indexer_router.app.note(
-                        f"LLM extracted concepts for {len(llm_concepts)} files",
-                        tags=["indexing", "llm-concepts"]
-                    )
-            except Exception as e:
-                indexer_router.app.note(
-                    f"LLM concept extraction skipped: {e}",
-                    tags=["indexing", "llm-concepts", "warning"]
-                )
-
-            # 3. Hierarchical Summaries
+            # Hierarchical Summaries (the only LLM work at index time)
             module_sums = []
             semantic_sum = {}
             try:
@@ -212,20 +161,20 @@ async def index_project(project_path: str) -> dict:
                     tags=["indexing", "summarizer", "warning"]
                 )
 
-            # 4. Save enriched index (overwrites Phase 1 data with LLM-enhanced version)
+            # Save enriched index with summaries
             save_index(
-                bg_file_index, enriched_keywords, bg_symbol_map, project_path,
+                bg_file_index, bg_keyword_map, bg_symbol_map, project_path,
                 time.time(),
                 project_summary=project_summary,
                 imports_data=bg_imports,
-                categories_data=enriched_categories,
+                categories_data=bg_categories,
                 module_summaries_data=module_sums,
                 semantic_summary_data=semantic_sum,
             )
 
             _enrichment_status[project_path] = "complete"
             indexer_router.app.note(
-                "Phase 2 complete: LLM enrichment saved. Index fully upgraded.",
+                "Phase 2 complete: summaries saved. Index fully upgraded.",
                 tags=["indexing", "phase2", "complete"]
             )
 
@@ -377,35 +326,6 @@ async def update_index(project_path: str) -> dict:
 
     async def _enrich_update_background():
         try:
-            enriched_cats = bg_cats
-            enriched_kw = bg_kw
-
-            try:
-                llm_cats = await categorize_symbols_llm(bg_fi, bg_sm, project_root, indexer_router)
-                if llm_cats:
-                    enriched_cats = llm_cats
-            except Exception:
-                pass
-
-            try:
-                llm_concepts = await extract_concepts_llm(bg_fi, project_root, indexer_router)
-                if llm_concepts:
-                    for rp, concepts in llm_concepts.items():
-                        for concept in concepts:
-                            for word in concept.lower().split():
-                                word = word.strip(".,;:!?()[]{}\"'")
-                                if len(word) > 2:
-                                    enriched_kw.setdefault(word, [])
-                                    if rp not in enriched_kw[word]:
-                                        enriched_kw[word].append(rp)
-                            full = concept.lower().strip()
-                            if full and len(full) > 2:
-                                enriched_kw.setdefault(full, [])
-                                if rp not in enriched_kw[full]:
-                                    enriched_kw[full].append(rp)
-            except Exception:
-                pass
-
             mod_sums, sem_sum = [], {}
             try:
                 mod_sums, sem_sum = await generate_hierarchical_summary(
@@ -415,10 +335,10 @@ async def update_index(project_path: str) -> dict:
                 pass
 
             save_index(
-                bg_fi, enriched_kw, bg_sm, project_root, time.time(),
+                bg_fi, bg_kw, bg_sm, project_root, time.time(),
                 project_summary=project_summary,
                 imports_data=bg_imp,
-                categories_data=enriched_cats,
+                categories_data=bg_cats,
                 module_summaries_data=mod_sums,
                 semantic_summary_data=sem_sum,
             )
