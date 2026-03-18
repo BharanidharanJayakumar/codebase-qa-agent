@@ -89,3 +89,41 @@ async def stream_llm_response(
             "error": str(e),
             "partial_content": full_content,
         }
+
+
+async def stream_and_collect(
+    system: str,
+    user: str,
+    model: str = "",
+    max_tokens: int = 2048,
+    on_chunk: callable = None,
+) -> dict:
+    """
+    Stream LLM response and collect the full result.
+
+    Optionally calls on_chunk(text) for each chunk received.
+    Returns the complete response with timing metadata.
+    """
+    full_content = ""
+    metadata = {}
+
+    async for event in stream_llm_response(system, user, model, max_tokens):
+        if event["type"] == "chunk":
+            full_content += event["content"]
+            if on_chunk:
+                on_chunk(event["content"])
+        elif event["type"] == "done":
+            metadata = event["metadata"]
+            full_content = event["full_content"]
+        elif event["type"] == "error":
+            return {
+                "content": event.get("partial_content", ""),
+                "error": event["error"],
+                "metadata": {},
+            }
+
+    return {
+        "content": full_content,
+        "error": None,
+        "metadata": metadata,
+    }
