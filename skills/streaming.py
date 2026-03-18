@@ -127,3 +127,54 @@ async def stream_and_collect(
         "error": None,
         "metadata": metadata,
     }
+
+
+def parse_json_from_stream(content: str, schema_class=None):
+    """
+    Parse structured JSON from a streamed LLM response.
+
+    The LLM may wrap JSON in markdown code blocks or include extra text.
+    This extracts and validates the JSON against an optional Pydantic schema.
+    """
+    import re
+
+    # Try direct parse first
+    try:
+        data = json.loads(content)
+        if schema_class:
+            return schema_class.model_validate(data)
+        return data
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # Try extracting from markdown code block
+    json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            if schema_class:
+                return schema_class.model_validate(data)
+            return data
+        except (json.JSONDecodeError, Exception):
+            pass
+
+    # Try finding JSON object in the content
+    brace_start = content.find("{")
+    if brace_start >= 0:
+        depth = 0
+        for i in range(brace_start, len(content)):
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        data = json.loads(content[brace_start : i + 1])
+                        if schema_class:
+                            return schema_class.model_validate(data)
+                        return data
+                    except (json.JSONDecodeError, Exception):
+                        pass
+                    break
+
+    return None
