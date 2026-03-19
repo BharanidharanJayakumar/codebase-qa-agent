@@ -54,9 +54,22 @@ class NavigationDecision(BaseModel):
     )
 
 
+class CodeCitation(BaseModel):
+    """A reference to a specific location in the codebase."""
+    file: str = Field(description="Relative file path")
+    start_line: int = Field(description="Starting line number")
+    end_line: int | None = Field(default=None, description="Ending line number (if range)")
+    symbol: str = Field(default="", description="Function/class name if applicable")
+    snippet: str = Field(default="", description="Brief code snippet or what this citation supports")
+
+
 class AnswerWithDrilldown(BaseModel):
-    """LLM output: answer with optional request for more files."""
-    answer: str = Field(description="Clear, direct answer to the question")
+    """LLM output: answer with code citations and optional request for more files."""
+    answer: str = Field(description="Clear, direct answer with inline references like [1], [2], etc.")
+    citations: list[CodeCitation] = Field(
+        default_factory=list,
+        description="Numbered list of code references backing up claims in the answer. [1] maps to citations[0], etc."
+    )
     relevant_files: list[str] = Field(description="Files most relevant to this answer")
     confidence: str = Field(description="high, medium, or low")
     follow_up: list[str] = Field(description="1-2 follow-up questions the user might want to ask")
@@ -94,6 +107,17 @@ ANSWER_SYSTEM = """You are an expert software engineer helping a developer under
 
 Answer questions using ONLY the provided context (source code, summaries, metadata).
 Be specific and accurate — mention file names, function names, and how things connect.
+
+CITATION RULES (IMPORTANT):
+- Back up every technical claim with a numbered citation: [1], [2], etc.
+- Each citation references a specific file and line range from the provided context
+- The citation number maps to the citations array index (1-indexed: [1] = citations[0])
+- Include the file path, start_line, end_line, and the symbol name if applicable
+- Include a brief snippet or description of what the citation supports
+- Every function, class, or important pattern you mention MUST have a citation
+- Use the line numbers from the === FILE: path [lines X-Y] === headers in the context
+
+Example citation format in your answer: "The authentication is handled by the `verify_token` function [1] which calls the JWT library [2]."
 
 If the provided context is insufficient to fully answer the question:
 - Set needs_more_context=True
@@ -377,9 +401,16 @@ def read_targeted_files(
         if len(content) > per_file_cap:
             content = content[:per_file_cap] + "\n... (truncated)"
 
-        header = f"=== FILE: {rel_path} ==="
-        parts.append(f"{header}\n{content}")
-        chars_used += len(header) + len(content) + 2
+        # Add line numbers to content for citation support
+        numbered_lines = []
+        for i, line in enumerate(content.split("\n"), 1):
+            numbered_lines.append(f"{i:4d} | {line}")
+        numbered_content = "\n".join(numbered_lines)
+
+        total_lines = content.count("\n") + 1
+        header = f"=== FILE: {rel_path} [lines 1-{total_lines}] ==="
+        parts.append(f"{header}\n{numbered_content}")
+        chars_used += len(header) + len(numbered_content) + 2
 
     if not parts:
         return ""
