@@ -20,8 +20,9 @@ from pathlib import Path as _Path
 from reasoners.retrieval import retrieve_context
 from reasoners.navigator import (
     navigate, navigate_fallback, read_targeted_files, read_files_by_paths,
-    build_summary_context, AnswerWithDrilldown, ANSWER_SYSTEM,
+    build_summary_context, AnswerWithDrilldown, CodeCitation, ANSWER_SYSTEM,
 )
+from skills.streaming import stream_and_collect, parse_json_from_stream
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,11 @@ qa_router = AgentRouter(prefix="qa", tags=["question-answering"])
 
 class Answer(BaseModel):
     """Final answer schema (used for drill-down final round)."""
-    answer: str = Field(description="Clear, direct answer to the question")
+    answer: str = Field(description="Clear, direct answer with inline citations like [1], [2]")
+    citations: list[CodeCitation] = Field(
+        default_factory=list,
+        description="Numbered code references backing claims in the answer"
+    )
     relevant_files: list[str] = Field(description="Files most relevant to this question")
     confidence: str = Field(description="high, medium, or low")
     follow_up: list[str] = Field(description="1-2 follow-up questions the user might want to ask")
@@ -259,9 +264,15 @@ async def answer_question(question: str, session_id: str = "", project_path: str
         tags=["qa", "query"]
     )
 
+    # Format citations for response
+    citations = []
+    if hasattr(result, "citations") and result.citations:
+        citations = [c.model_dump() for c in result.citations]
+
     return {
         **result.model_dump(),
         "relevant_files": list(dict.fromkeys(top_files))[:10],  # deduplicate
+        "citations": citations,
         "confidence": confidence,
         "session_id": session_id,
         "project_id": stored.get("project_id", ""),
@@ -409,3 +420,139 @@ async def search_code(query: str, project_path: str = "") -> dict:
                     return {"matches": matches, "total": len(matches), "truncated": True}
 
     return {"matches": matches, "total": len(matches)}
+
+
+# ── Streaming Answer Endpoint ────────────────────────────────────────────────
+
+@qa_router.reasoner()
+async def stream_answer(question: str, session_id: str = "", project_path: str = "") -> dict:
+    """
+    Answer a question with streaming LLM response. Returns the full answer
+    with streaming metadata (time-to-first-token, chunk count, total time).
+
+    Same flow as answer_question but uses streaming for faster perceived response.
+    """
+    import time as _time
+
+    stored = load_index(project_path)
+    if not stored:
+        return {
+            "answer": "No index found. Please run index_project first.",
+            "citations": [],
+            "relevant_files": [],
+            "confidence": "low",
+            "streaming_metadata": {},
+            "session_id": session_id,
+        }
+
+    file_index = stored["file_index"]
+    keyword_map = stored["keyword_map"]
+    symbol_map = stored["symbol_map"]
+    project_root = stored["project_root"]
+
+    history = load_session(session_id) if session_id else []
+
+    # Step 1: Navigate
+    try:
+        decision = await navigate(question, project_root, file_index, symbol_map, qa_router)
+    except Exception as e:
+        logger.warning(f"Navigator failed: {e}, using fallback")
+        decision = navigate_fallback(question, file_index)
+
+    # Step 2: Build context (same as answer_question)
+    context_parts = []
+    top_files = []
+
+    if decision.needs_code:
+        code_context = read_targeted_files(decision, file_index, project_root)
+        if code_context:
+            context_parts.append(code_context)
+        top_files = decision.target_files[:10]
+
+        if len(decision.target_files) < 2 and decision.search_terms:
+            bm25_ctx = retrieve_context(
+                " ".join(decision.search_terms), file_index, keyword_map, symbol_map, project_root
+            )
+            if bm25_ctx["context"]:
+                context_parts.append("=== ADDITIONAL SEARCH RESULTS ===\n" + bm25_ctx["context"])
+                top_files.extend(bm25_ctx["top_files"])
+    else:
+        summary_ctx = build_summary_context(project_root)
+        if summary_ctx:
+            context_parts.append(summary_ctx)
+
+    if _is_aggregate(question):
+        agg_ctx, _ = _format_aggregate(question, project_path)
+        if agg_ctx:
+            context_parts.append(agg_ctx)
+
+    retrieved_context = "\n\n".join(p for p in context_parts if p.strip())
+
+    if not retrieved_context.strip():
+        bm25_ctx = retrieve_context(question, file_index, keyword_map, symbol_map, project_root)
+        if bm25_ctx["context"]:
+            retrieved_context = "=== SOURCE CODE ===\n" + bm25_ctx["context"]
+            top_files = bm25_ctx["top_files"]
+        else:
+            return {
+                "answer": "No relevant information found for this question.",
+                "citations": [],
+                "relevant_files": [],
+                "confidence": "low",
+                "streaming_metadata": {},
+                "session_id": session_id,
+            }
+
+    # Build history block
+    history_block = ""
+    if history:
+        parts = []
+        for turn in history[-3:]:
+            parts.append(f"Q: {turn['question']}\nA: {turn['answer']}")
+        history_block = "Previous conversation:\n" + "\n---\n".join(parts) + "\n\n---\nNow answer:\n\n"
+
+    # Step 3: Stream the answer
+    user_prompt = (
+        f"{history_block}"
+        f"Question: {question}\n\n"
+        f"Context from the codebase:\n\n"
+        f"{retrieved_context}"
+    )
+
+    # Use streaming to get faster response
+    stream_result = await stream_and_collect(
+        system=ANSWER_SYSTEM,
+        user=user_prompt,
+        max_tokens=2048,
+    )
+
+    # Parse the streamed response into structured format
+    parsed = parse_json_from_stream(stream_result["content"], AnswerWithDrilldown)
+
+    if parsed:
+        answer_text = parsed.answer
+        citations = [c.model_dump() for c in parsed.citations] if parsed.citations else []
+        confidence = parsed.confidence
+        follow_up = parsed.follow_up
+        relevant = parsed.relevant_files
+    else:
+        # Fallback: use raw content as answer
+        answer_text = stream_result["content"]
+        citations = []
+        confidence = "medium"
+        follow_up = []
+        relevant = top_files
+
+    if session_id:
+        save_session_turn(session_id, question, answer_text, top_files)
+
+    return {
+        "answer": answer_text,
+        "citations": citations,
+        "relevant_files": list(dict.fromkeys(top_files + relevant))[:10],
+        "confidence": confidence,
+        "follow_up": follow_up,
+        "streaming_metadata": stream_result.get("metadata", {}),
+        "session_id": session_id,
+        "project_id": stored.get("project_id", ""),
+    }
