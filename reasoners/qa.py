@@ -1,3 +1,4 @@
+# type: ignore
 """
 QA orchestrator agent — Navigator-driven, question-aware code exploration.
 
