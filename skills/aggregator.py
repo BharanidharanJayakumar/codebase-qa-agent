@@ -4,6 +4,7 @@ All pure Python — no LLM calls. Runs at index time.
 """
 
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -312,3 +313,251 @@ def categorize_symbols(
             results.append((rel_path, symbols[0]["name"], "route", "file-level"))
 
     return results
+
+
+# ── Extension to language name mapping ───────────────────────────────────────
+
+EXT_TO_LANGUAGE = {
+    "py": "Python", "js": "JavaScript", "ts": "TypeScript", "jsx": "React JSX",
+    "tsx": "React TSX", "go": "Go", "java": "Java", "cs": "C#", "rs": "Rust",
+    "rb": "Ruby", "php": "PHP", "c": "C", "cpp": "C++", "h": "C/C++ Header",
+    "hpp": "C++ Header", "swift": "Swift", "kt": "Kotlin", "scala": "Scala",
+    "ex": "Elixir", "exs": "Elixir Script", "dart": "Dart", "lua": "Lua",
+    "sh": "Shell", "bash": "Bash", "zsh": "Zsh", "ps1": "PowerShell",
+    "sql": "SQL", "graphql": "GraphQL", "gql": "GraphQL", "proto": "Protocol Buffers",
+    "yaml": "YAML", "yml": "YAML", "toml": "TOML", "json": "JSON",
+    "xml": "XML", "html": "HTML", "css": "CSS", "scss": "SCSS", "less": "LESS",
+    "md": "Markdown", "rst": "reStructuredText", "vue": "Vue SFC", "svelte": "Svelte",
+}
+
+
+# ── Architecture pattern detection ───────────────────────────────────────────
+
+ARCHITECTURE_INDICATORS = {
+    "mvc": {
+        "dirs": {"controllers", "models", "views"},
+        "name": "MVC (Model-View-Controller)",
+        "description": "Separates data (models), UI (views), and logic (controllers)",
+    },
+    "layered": {
+        "dirs": {"services", "repositories", "controllers"},
+        "name": "Layered Architecture",
+        "description": "Organized in layers: presentation → business logic → data access",
+    },
+    "clean": {
+        "dirs": {"domain", "usecases", "adapters", "entities"},
+        "name": "Clean Architecture",
+        "description": "Domain-centric with dependency inversion between layers",
+    },
+    "hexagonal": {
+        "dirs": {"ports", "adapters", "domain"},
+        "name": "Hexagonal (Ports & Adapters)",
+        "description": "Core domain isolated from external integrations via ports",
+    },
+    "modular": {
+        "dirs": {"modules", "features", "packages"},
+        "name": "Modular / Feature-based",
+        "description": "Code organized by feature/domain module rather than technical layer",
+    },
+    "microservices": {
+        "files": {"docker-compose.yml", "docker-compose.yaml", "Dockerfile"},
+        "dirs": {"gateway", "services", "proto"},
+        "name": "Microservices / Multi-service",
+        "description": "Multiple independently deployable services",
+    },
+    "monorepo": {
+        "dirs": {"packages", "apps", "libs"},
+        "files": {"lerna.json", "pnpm-workspace.yaml", "turbo.json", "nx.json"},
+        "name": "Monorepo",
+        "description": "Multiple projects/packages managed in a single repository",
+    },
+    "serverless": {
+        "files": {"serverless.yml", "serverless.yaml", "template.yaml", "sam.yaml"},
+        "dirs": {"functions", "lambdas"},
+        "name": "Serverless",
+        "description": "Cloud functions / event-driven serverless architecture",
+    },
+}
+
+
+def detect_architecture_pattern(file_index: dict, project_root: str) -> dict:
+    """Detect architecture patterns from directory structure and config files."""
+    root = Path(project_root)
+    all_dirs = set()
+    for rel_path in file_index:
+        parts = Path(rel_path).parts
+        for p in parts[:-1]:
+            all_dirs.add(p.lower())
+
+    detected = []
+    for pattern_key, indicators in ARCHITECTURE_INDICATORS.items():
+        score = 0
+        required_dirs = indicators.get("dirs", set())
+        required_files = indicators.get("files", set())
+
+        if required_dirs:
+            matches = required_dirs & all_dirs
+            if len(matches) >= 2 or (len(required_dirs) <= 2 and matches):
+                score += len(matches)
+
+        if required_files:
+            for f in required_files:
+                if (root / f).exists():
+                    score += 2
+
+        if score > 0:
+            detected.append({
+                "pattern": indicators["name"],
+                "description": indicators["description"],
+                "confidence": "high" if score >= 3 else "medium" if score >= 2 else "low",
+                "score": score,
+            })
+
+    detected.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "primary": detected[0] if detected else {
+            "pattern": "Standard",
+            "description": "Conventional project structure",
+            "confidence": "low",
+        },
+        "all_detected": detected,
+    }
+
+
+# ── Entry point discovery ────────────────────────────────────────────────────
+
+ENTRY_POINT_PATTERNS = [
+    ("main.py", "Python main entry point"),
+    ("app.py", "Python application entry"),
+    ("manage.py", "Django management script"),
+    ("wsgi.py", "WSGI application entry"),
+    ("asgi.py", "ASGI application entry"),
+    ("__main__.py", "Python package entry point"),
+    ("cli.py", "CLI entry point"),
+    ("server.py", "Server entry point"),
+    ("index.js", "JavaScript entry point"),
+    ("index.ts", "TypeScript entry point"),
+    ("server.js", "Node.js server entry"),
+    ("server.ts", "Node.js server entry"),
+    ("app.js", "Express/Node app entry"),
+    ("app.ts", "Express/Node app entry"),
+    ("main.go", "Go main entry point"),
+    ("Application.java", "Spring Boot entry"),
+    ("main.rs", "Rust main entry point"),
+    ("lib.rs", "Rust library entry point"),
+]
+
+
+def find_entry_points(file_index: dict, project_root: str) -> list[dict]:
+    """Discover application entry points."""
+    entries = []
+    file_paths = set(file_index.keys())
+
+    for pattern, description in ENTRY_POINT_PATTERNS:
+        for rel_path in file_paths:
+            filename = Path(rel_path).name
+            if filename == pattern or rel_path == pattern or rel_path.endswith("/" + pattern):
+                meta = file_index.get(rel_path, {})
+                entries.append({
+                    "file": rel_path,
+                    "description": description,
+                    "symbols": meta.get("symbols", [])[:5],
+                    "size_bytes": meta.get("size_bytes", 0),
+                })
+
+    # Check for __name__ == "__main__" pattern
+    for rel_path, meta in file_index.items():
+        if not rel_path.endswith(".py"):
+            continue
+        chunks = meta.get("chunks", [])
+        content = "\n".join(c.get("content", "") for c in chunks)
+        if '__name__' in content and '__main__' in content:
+            if not any(e["file"] == rel_path for e in entries):
+                entries.append({
+                    "file": rel_path,
+                    "description": "Python script with __main__ guard",
+                    "symbols": meta.get("symbols", [])[:5],
+                    "size_bytes": meta.get("size_bytes", 0),
+                })
+
+    return entries[:15]
+
+
+# ── Code complexity metrics ──────────────────────────────────────────────────
+
+def compute_complexity_metrics(file_index: dict) -> dict:
+    """Compute code complexity and size metrics."""
+    file_sizes = []
+    file_lines = []
+    symbols_per_file = []
+    ext_lines = Counter()
+
+    for rel_path, meta in file_index.items():
+        size = meta.get("size_bytes", 0)
+        file_sizes.append((rel_path, size))
+
+        chunks = meta.get("chunks", [])
+        max_line = 0
+        for chunk in chunks:
+            end = chunk.get("end_line", 0)
+            if end > max_line:
+                max_line = end
+        file_lines.append((rel_path, max_line))
+
+        sym_count = len(meta.get("symbols", []))
+        symbols_per_file.append((rel_path, sym_count))
+
+        ext = meta.get("extension", "").lstrip(".")
+        ext_lines[ext] += max_line
+
+    total_files = len(file_index)
+    total_lines = sum(lines for _, lines in file_lines)
+    total_size = sum(size for _, size in file_sizes)
+    total_symbols = sum(count for _, count in symbols_per_file)
+
+    file_sizes.sort(key=lambda x: x[1], reverse=True)
+    file_lines.sort(key=lambda x: x[1], reverse=True)
+    symbols_per_file.sort(key=lambda x: x[1], reverse=True)
+
+    language_breakdown = []
+    for ext, lines in ext_lines.most_common(10):
+        lang_name = EXT_TO_LANGUAGE.get(ext, ext.upper())
+        pct = round(lines / total_lines * 100, 1) if total_lines > 0 else 0
+        language_breakdown.append({
+            "language": lang_name,
+            "extension": ext,
+            "lines": lines,
+            "percentage": pct,
+        })
+
+    return {
+        "total_files": total_files,
+        "total_lines": total_lines,
+        "total_size_bytes": total_size,
+        "total_size_human": _human_size(total_size),
+        "total_symbols": total_symbols,
+        "avg_file_size_lines": round(total_lines / total_files) if total_files > 0 else 0,
+        "avg_symbols_per_file": round(total_symbols / total_files, 1) if total_files > 0 else 0,
+        "largest_files": [
+            {"file": f, "size_bytes": s, "size_human": _human_size(s)}
+            for f, s in file_sizes[:5]
+        ],
+        "longest_files": [
+            {"file": f, "lines": l} for f, l in file_lines[:5]
+        ],
+        "most_complex_files": [
+            {"file": f, "symbol_count": c} for f, c in symbols_per_file[:5]
+        ],
+        "language_breakdown": language_breakdown,
+    }
+
+
+def _human_size(size_bytes: int) -> str:
+    """Convert bytes to human-readable size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} B"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
