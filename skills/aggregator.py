@@ -897,3 +897,4 @@ def _generate_insights(
         insights.append(f"Most complex file: {top['file']} with {top['symbol_count']} symbols")
 
     return insights
+
