@@ -533,4 +533,3 @@ def build_summary_context(project_root: str) -> str:
         parts.append("\n".join(section))
 
     return "\n\n".join(parts)
-
