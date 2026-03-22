@@ -561,3 +561,160 @@ def _human_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+# ── Infrastructure detection ─────────────────────────────────────────────────
+
+INFRA_FILES = {
+    "Dockerfile": {"category": "containerization", "name": "Docker"},
+    "docker-compose.yml": {"category": "containerization", "name": "Docker Compose"},
+    "docker-compose.yaml": {"category": "containerization", "name": "Docker Compose"},
+    ".dockerignore": {"category": "containerization", "name": "Docker"},
+    ".github/workflows": {"category": "ci_cd", "name": "GitHub Actions"},
+    ".gitlab-ci.yml": {"category": "ci_cd", "name": "GitLab CI"},
+    "Jenkinsfile": {"category": "ci_cd", "name": "Jenkins"},
+    ".circleci/config.yml": {"category": "ci_cd", "name": "CircleCI"},
+    ".travis.yml": {"category": "ci_cd", "name": "Travis CI"},
+    "bitbucket-pipelines.yml": {"category": "ci_cd", "name": "Bitbucket Pipelines"},
+    "azure-pipelines.yml": {"category": "ci_cd", "name": "Azure Pipelines"},
+    "k8s/": {"category": "orchestration", "name": "Kubernetes"},
+    "kubernetes/": {"category": "orchestration", "name": "Kubernetes"},
+    "helm/": {"category": "orchestration", "name": "Helm Charts"},
+    "Chart.yaml": {"category": "orchestration", "name": "Helm Charts"},
+    "terraform/": {"category": "iac", "name": "Terraform"},
+    "main.tf": {"category": "iac", "name": "Terraform"},
+    ".eslintrc": {"category": "quality", "name": "ESLint"},
+    ".eslintrc.js": {"category": "quality", "name": "ESLint"},
+    ".eslintrc.json": {"category": "quality", "name": "ESLint"},
+    "eslint.config.js": {"category": "quality", "name": "ESLint"},
+    ".prettierrc": {"category": "quality", "name": "Prettier"},
+    ".flake8": {"category": "quality", "name": "Flake8"},
+    "pyproject.toml": {"category": "quality", "name": "Python Project Config"},
+    "ruff.toml": {"category": "quality", "name": "Ruff"},
+    "vercel.json": {"category": "deployment", "name": "Vercel"},
+    "netlify.toml": {"category": "deployment", "name": "Netlify"},
+    "fly.toml": {"category": "deployment", "name": "Fly.io"},
+    "Procfile": {"category": "deployment", "name": "Heroku"},
+    ".env.example": {"category": "config", "name": "Environment Config"},
+    ".env.sample": {"category": "config", "name": "Environment Config"},
+    "Makefile": {"category": "build", "name": "Make"},
+}
+
+
+def detect_infrastructure(project_root: str) -> dict:
+    """Detect infrastructure, CI/CD, deployment, and tooling configuration."""
+    root = Path(project_root)
+    found = {}
+
+    for file_or_dir, info in INFRA_FILES.items():
+        target = root / file_or_dir
+        if target.exists():
+            cat = info["category"]
+            found.setdefault(cat, [])
+            if info["name"] not in found[cat]:
+                found[cat].append(info["name"])
+
+    gh_workflows = root / ".github" / "workflows"
+    if gh_workflows.is_dir():
+        found.setdefault("ci_cd", [])
+        if "GitHub Actions" not in found["ci_cd"]:
+            found["ci_cd"].append("GitHub Actions")
+        workflow_count = len(list(gh_workflows.glob("*.yml"))) + len(list(gh_workflows.glob("*.yaml")))
+        if workflow_count > 0:
+            found["ci_cd_detail"] = [f"{workflow_count} workflow(s)"]
+
+    return found
+
+
+# ── Test coverage estimation ─────────────────────────────────────────────────
+
+TEST_FRAMEWORKS = {
+    ".py": {"pytest", "unittest", "nose", "hypothesis"},
+    ".js": {"jest", "mocha", "vitest", "ava", "tape", "jasmine"},
+    ".ts": {"jest", "mocha", "vitest", "jasmine"},
+    ".go": {"testing"},
+    ".java": {"junit", "testng", "mockito"},
+    ".rs": {"test"},
+    ".rb": {"rspec", "minitest"},
+    ".cs": {"xunit", "nunit", "mstest"},
+}
+
+
+def analyze_test_coverage(file_index: dict) -> dict:
+    """Estimate test coverage and identify test infrastructure."""
+    test_files = []
+    source_files = []
+    test_frameworks_found = set()
+
+    for rel_path, meta in file_index.items():
+        path_lower = rel_path.lower()
+        path_parts = {p.lower() for p in Path(rel_path).parts}
+        is_test = (
+            any(seg in path_parts for seg in TEST_PATH_SEGMENTS)
+            or "test_" in Path(rel_path).name.lower()
+            or ".test." in path_lower
+            or ".spec." in path_lower
+            or "_test." in path_lower
+        )
+
+        if is_test:
+            test_files.append(rel_path)
+            chunks = meta.get("chunks", [])
+            content = "\n".join(c.get("content", "") for c in chunks[:3])
+            ext = meta.get("extension", "")
+            frameworks = TEST_FRAMEWORKS.get(ext, set())
+            for fw in frameworks:
+                if fw.lower() in content.lower():
+                    test_frameworks_found.add(fw)
+        else:
+            source_files.append(rel_path)
+
+    total = len(file_index)
+    test_count = len(test_files)
+    source_count = len(source_files)
+    ratio = round(test_count / source_count * 100, 1) if source_count > 0 else 0
+
+    return {
+        "test_file_count": test_count,
+        "source_file_count": source_count,
+        "test_to_source_ratio": ratio,
+        "test_ratio_label": (
+            "Strong" if ratio >= 80 else
+            "Good" if ratio >= 50 else
+            "Moderate" if ratio >= 25 else
+            "Low" if ratio > 0 else
+            "None detected"
+        ),
+        "test_frameworks": sorted(test_frameworks_found),
+        "test_files": test_files[:20],
+    }
+
+
+# ── Top files by connectivity ────────────────────────────────────────────────
+
+def find_top_connected_files(file_index: dict, imports_data: list) -> list[dict]:
+    """Find files most imported by others (highest fan-in)."""
+    imported_by = Counter()
+
+    for entry in imports_data:
+        if isinstance(entry, (list, tuple)):
+            target = entry[2] if len(entry) > 2 else None
+        elif isinstance(entry, dict):
+            target = entry.get("target_path")
+        else:
+            continue
+        if target:
+            imported_by[target] += 1
+
+    top = imported_by.most_common(10)
+    results = []
+    for path, count in top:
+        meta = file_index.get(path, {})
+        results.append({
+            "file": path,
+            "imported_by_count": count,
+            "symbols": meta.get("symbols", [])[:8],
+            "role": "Core dependency — many files depend on this",
+        })
+
+    return results
+
+
