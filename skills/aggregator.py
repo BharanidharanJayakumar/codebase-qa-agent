@@ -718,3 +718,182 @@ def find_top_connected_files(file_index: dict, imports_data: list) -> list[dict]
     return results
 
 
+# ── External dependency analysis ─────────────────────────────────────────────
+
+def detect_external_dependencies(project_root: str) -> dict:
+    """Parse dependency files to extract external libraries."""
+    root = Path(project_root)
+    deps = {}
+
+    # package.json
+    pkg_json = root / "package.json"
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text(errors="replace"))
+            prod = data.get("dependencies", {})
+            dev = data.get("devDependencies", {})
+            deps["npm"] = {
+                "production": list(prod.keys()),
+                "development": list(dev.keys()),
+                "total": len(prod) + len(dev),
+            }
+        except (json.JSONDecodeError, Exception):
+            pass
+
+    # requirements.txt
+    req_txt = root / "requirements.txt"
+    if req_txt.exists():
+        try:
+            lines = req_txt.read_text(errors="replace").strip().split("\n")
+            packages = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith("-"):
+                    name = re.split(r"[>=<!\[]", line)[0].strip()
+                    if name:
+                        packages.append(name)
+            deps["pip"] = {"packages": packages, "total": len(packages)}
+        except Exception:
+            pass
+
+    # pyproject.toml (basic parsing)
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists() and "pip" not in deps:
+        try:
+            content = pyproject.read_text(errors="replace")
+            dep_match = re.search(r'dependencies\s*=\s*\[(.*?)\]', content, re.DOTALL)
+            if dep_match:
+                dep_str = dep_match.group(1)
+                packages = re.findall(r'"([^"]+)"', dep_str)
+                names = [re.split(r"[>=<!\[]", p)[0].strip() for p in packages]
+                deps["pip"] = {"packages": names, "total": len(names)}
+        except Exception:
+            pass
+
+    # go.mod
+    go_mod = root / "go.mod"
+    if go_mod.exists():
+        try:
+            content = go_mod.read_text(errors="replace")
+            require_match = re.findall(r'^\s+([\w./\-]+)\s+v', content, re.MULTILINE)
+            deps["go"] = {"modules": require_match, "total": len(require_match)}
+        except Exception:
+            pass
+
+    # Cargo.toml
+    cargo = root / "Cargo.toml"
+    if cargo.exists():
+        try:
+            content = cargo.read_text(errors="replace")
+            crate_matches = re.findall(r'^(\w[\w-]*)\s*=', content, re.MULTILINE)
+            skip = {"name", "version", "edition", "authors", "description", "license", "repository"}
+            crates = [c for c in crate_matches if c not in skip]
+            deps["cargo"] = {"crates": crates, "total": len(crates)}
+        except Exception:
+            pass
+
+    # Gemfile
+    gemfile = root / "Gemfile"
+    if gemfile.exists():
+        try:
+            content = gemfile.read_text(errors="replace")
+            gems = re.findall(r"""gem\s+['"]([^'"]+)['"]""", content)
+            deps["bundler"] = {"gems": gems, "total": len(gems)}
+        except Exception:
+            pass
+
+    return deps
+
+
+# ── Comprehensive project report ─────────────────────────────────────────────
+
+def build_comprehensive_report(
+    project_root: str, file_index: dict, symbol_map: dict, imports_data: list = None
+) -> dict:
+    """Build a comprehensive project report with all analysis."""
+    basic_summary = build_project_summary(project_root, file_index, symbol_map)
+    architecture = detect_architecture_pattern(file_index, project_root)
+    entry_points = find_entry_points(file_index, project_root)
+    complexity = compute_complexity_metrics(file_index)
+    infrastructure = detect_infrastructure(project_root)
+    tests = analyze_test_coverage(file_index)
+    external_deps = detect_external_dependencies(project_root)
+    top_connected = find_top_connected_files(file_index, imports_data or [])
+
+    insights = _generate_insights(
+        basic_summary, architecture, complexity, tests, infrastructure, entry_points
+    )
+
+    return {
+        "project_description": basic_summary.get("project_description", ""),
+        "readme_excerpt": basic_summary.get("readme_content", "")[:500],
+        "architecture": architecture,
+        "entry_points": entry_points,
+        "complexity": complexity,
+        "infrastructure": infrastructure,
+        "test_analysis": tests,
+        "external_dependencies": external_deps,
+        "top_connected_files": top_connected,
+        "framework_hints": basic_summary.get("framework_hints", []),
+        "dependency_files": basic_summary.get("dependency_files", []),
+        "directory_tree": basic_summary.get("directory_tree", {}),
+        "insights": insights,
+    }
+
+
+def _generate_insights(
+    summary: dict, architecture: dict, complexity: dict,
+    tests: dict, infrastructure: dict, entry_points: list
+) -> list[str]:
+    """Generate developer-focused insights about the project."""
+    insights = []
+
+    total_files = complexity.get("total_files", 0)
+    total_lines = complexity.get("total_lines", 0)
+    if total_files < 10:
+        insights.append(f"Small project with {total_files} files and ~{total_lines} lines of code")
+    elif total_files < 50:
+        insights.append(f"Medium-sized project: {total_files} files, ~{total_lines:,} lines of code")
+    elif total_files < 200:
+        insights.append(f"Substantial project: {total_files} files, ~{total_lines:,} lines of code")
+    else:
+        insights.append(f"Large codebase: {total_files} files, ~{total_lines:,} lines of code")
+
+    primary = architecture.get("primary", {})
+    if primary.get("pattern") and primary["pattern"] != "Standard":
+        insights.append(f"Architecture: {primary['pattern']} — {primary.get('description', '')}")
+
+    frameworks = summary.get("framework_hints", [])
+    if frameworks:
+        insights.append(f"Tech stack: {', '.join(frameworks)}")
+
+    test_ratio = tests.get("test_to_source_ratio", 0)
+    test_label = tests.get("test_ratio_label", "None")
+    if test_ratio > 0:
+        insights.append(f"Test coverage: {test_label} ({test_ratio}% test-to-source ratio, {tests['test_file_count']} test files)")
+    else:
+        insights.append("No test files detected — consider adding tests")
+
+    if infrastructure.get("ci_cd"):
+        insights.append(f"CI/CD: {', '.join(infrastructure['ci_cd'])}")
+    if infrastructure.get("containerization"):
+        insights.append(f"Containerized with {', '.join(infrastructure['containerization'])}")
+    if infrastructure.get("deployment"):
+        insights.append(f"Deployment: {', '.join(infrastructure['deployment'])}")
+
+    if entry_points:
+        main_entries = [e["file"] for e in entry_points[:3]]
+        insights.append(f"Entry points: {', '.join(main_entries)}")
+
+    avg_lines = complexity.get("avg_file_size_lines", 0)
+    if avg_lines > 300:
+        insights.append(f"Average file length is {avg_lines} lines — some files may benefit from splitting")
+    elif avg_lines > 0:
+        insights.append(f"Clean file sizes averaging {avg_lines} lines per file")
+
+    most_complex = complexity.get("most_complex_files", [])
+    if most_complex and most_complex[0]["symbol_count"] > 20:
+        top = most_complex[0]
+        insights.append(f"Most complex file: {top['file']} with {top['symbol_count']} symbols")
+
+    return insights
