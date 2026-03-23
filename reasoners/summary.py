@@ -217,4 +217,3 @@ async def query_imports(
         "external_count": external_count,
         "total": len(imports),
     }
-
