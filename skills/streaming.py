@@ -178,4 +178,3 @@ def parse_json_from_stream(content: str, schema_class=None):
                     break
 
     return None
-
