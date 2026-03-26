@@ -1,4 +1,9 @@
 """Tests for code citation schema validation."""
+import sys
+from unittest.mock import MagicMock
+
+# Mock agentfield before importing navigator
+sys.modules["agentfield"] = MagicMock()
 from reasoners.navigator import CodeCitation, AnswerWithDrilldown
 
 

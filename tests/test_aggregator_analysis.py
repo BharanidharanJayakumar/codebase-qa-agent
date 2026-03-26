@@ -101,8 +101,8 @@ class TestComplexityMetrics:
         })
         metrics = compute_complexity_metrics(fi)
         langs = {b["extension"] for b in metrics["language_breakdown"]}
-        assert ".py" in langs
-        assert ".js" in langs
+        assert "py" in langs
+        assert "js" in langs
 
 
 class TestTestCoverage:
